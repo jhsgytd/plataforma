@@ -8,6 +8,7 @@ import { LeftPanel } from '@/components/studio/left-panel'
 import { EditorCanvas } from '@/components/studio/editor-canvas'
 import { RightPanel } from '@/components/studio/right-panel'
 import { useKeyboardShortcuts } from '@/hooks/use-keyboard-shortcuts'
+import { useAutosave } from '@/hooks/use-autosave'
 
 export default function StudioPage() {
   const searchParams = useSearchParams()
@@ -51,8 +52,9 @@ export default function StudioPage() {
     }
   }, [pageSlug, pages, currentPageId, setCurrentPage])
 
-  // Enable keyboard shortcuts
+  // Enable keyboard shortcuts and autosave
   useKeyboardShortcuts()
+  useAutosave()
 
   return (
     <div className="h-screen flex flex-col bg-[#0a0a12] text-white overflow-hidden">

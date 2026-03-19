@@ -227,6 +227,8 @@ interface EditorStore extends EditorState {
   saveProject: () => void
   loadProject: () => void
   exportPage: (pageId: string) => string
+  hasUnsavedChanges: boolean
+  setHasUnsavedChanges: (value: boolean) => void
   
   // Utils
   getCurrentPage: () => EditorPage | null
@@ -258,6 +260,7 @@ export const useEditorStore = create<EditorStore>()(
       rightPanelTab: 'content',
       leftPanelTab: 'pages',
       showGuide: true,
+      hasUnsavedChanges: false,
 
       // Page actions
       addPage: (name, slug) => {
