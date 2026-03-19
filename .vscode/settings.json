@@ -1,0 +1,6 @@
+{
+  "files.associations": {
+    "**/.next/dev/trace": "plaintext",
+    "**/*.tsbuildinfo": "plaintext"
+  }
+}

@@ -1,0 +1,2664 @@
+/**
+ * Runtime injected into the iframe canvas for imported HTML blocks.
+ *
+ * Interactions:
+ * - single click: select
+ * - double click: inline edit for text nodes
+ * - blur: save text
+ * - drag: reorder simple blocks
+ *
+ * Parent -> iframe commands:
+ * - style | text | html | replace | attr | highlight | deselect | enable_drag
+ */
+
+export interface EditorElementInfo {
+  eid: string | null
+  nodeType: "image" | "button" | "field" | "icon" | "text" | "container" | null
+  tag: string
+  id: string | null
+  classes: string | null
+  parentEid: string | null
+  parentTag: string | null
+  children: Array<{ eid: string | null; tag: string; label: string }>
+  text: string | null
+  html: string | null
+  isText: boolean
+  isLink: boolean
+  isButton: boolean
+  isActionable: boolean
+  attrs: {
+    href: string | null
+    target: string | null
+    placeholder: string | null
+    src: string | null
+    type: string | null
+    alt: string | null
+    title: string | null
+    dataIcon: string | null
+  }
+  styles: {
+    color: string
+    backgroundColor: string
+    backgroundImage: string
+    fontSize: string
+    fontWeight: string
+    fontFamily: string
+    lineHeight: string
+    letterSpacing: string
+    padding: string
+    margin: string
+    borderRadius: string
+    textAlign: string
+    display: string
+    width: string
+    maxWidth: string
+    height: string
+    maxHeight: string
+    objectFit: string
+    borderWidth: string
+    borderColor: string
+    boxShadow: string
+    gap: string
+    justifyContent: string
+    alignItems: string
+  }
+}
+
+export type EditorMessage =
+  | { __editor_select: true; info: EditorElementInfo | null }
+  | { __editor_editing: true; eid: string | null }
+  | { __editor_text_change: true; eid: string | null; text: string; html: string }
+  | { __editor_moved: true; eid: string | null; targetEid: string | null; position: "before" | "after" | "inside" }
+  | { __editor_snapshot: true; html: string }
+  | { __hei_resize: number }
+
+export type EditorCommand =
+  | { __editor_cmd: true; cmd: "style"; eid: string; prop: string; value: string }
+  | { __editor_cmd: true; cmd: "style_query"; eid: string; selector: string; prop: string; value: string }
+  | { __editor_cmd: true; cmd: "style_batch"; eid: string; updates: Array<{ selector?: string; prop: string; value: string }> }
+  | { __editor_cmd: true; cmd: "icon_patch"; eid: string; color?: string; size?: string }
+  | { __editor_cmd: true; cmd: "text"; eid: string; value: string }
+  | { __editor_cmd: true; cmd: "html"; eid: string; value: string }
+  | { __editor_cmd: true; cmd: "replace"; eid: string; value: string }
+  | { __editor_cmd: true; cmd: "attr"; eid: string; attr: string; value: string }
+  | { __editor_cmd: true; cmd: "insert"; eid: string; position: "beforebegin" | "afterbegin" | "beforeend" | "afterend"; value: string }
+  | { __editor_cmd: true; cmd: "highlight"; eid: string }
+  | { __editor_cmd: true; cmd: "move_up"; eid: string }
+  | { __editor_cmd: true; cmd: "move_down"; eid: string }
+  | { __editor_cmd: true; cmd: "delete"; eid: string }
+  | { __editor_cmd: true; cmd: "cleanup_layout"; eid?: string }
+  | { __editor_cmd: true; cmd: "deselect" }
+  | { __editor_cmd: true; cmd: "enable_drag" }
+
+const TEXT_TAGS = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "span", "a", "button", "li", "td", "th", "label", "small", "strong", "em", "blockquote"])
+export const EDITOR_RUNTIME_VERSION = "2026-03-19-03"
+
+export function buildEditorRuntime(): string {
+  return `
+(function () {
+  "use strict";
+  var RUNTIME_VERSION = "${EDITOR_RUNTIME_VERSION}";
+
+  var TEXT_TAGS = ["p","h1","h2","h3","h4","h5","h6","span","a","button","li","td","th","label","small","strong","em","blockquote"];
+  var BLOCK_TAGS = ["section","article","div","li","tr","p","h1","h2","h3","h4","h5","h6","header","footer","aside","figure"];
+  var EID_SKIP = ["html","head","body","meta","link","style","script","iframe","noscript"];
+  var ICON_SHAPE_TAGS = ["path","rect","circle","line","polyline","polygon","ellipse","g","use"];
+  var editingEl = null;
+  var selectedEl = null;
+  var multiSelectMode = false;
+  var multiSelectedEls = [];
+  var dragEl = null;
+  var dragEnabled = false;
+  var freeMoveEl = null;
+  var freeMoveIsGroup = false;
+  var freeMoveState = null;
+  var resizeState = null;
+  var snapshotTimer = null;
+  var suppressSelectionClick = false;
+  var eidCounter = 1;
+
+  function markRuntime(node, attr) {
+    node.setAttribute(attr, "1");
+    return node;
+  }
+
+  document.documentElement.setAttribute("data-he-editor-runtime-version", RUNTIME_VERSION);
+
+  function mkDiv(css) {
+    var d = document.createElement("div");
+    d.style.cssText = css + ";pointer-events:none;";
+    markRuntime(d, "data-he-editor-overlay");
+    document.documentElement.appendChild(d);
+    return d;
+  }
+
+  var hoverBox = mkDiv(
+    "position:fixed;border:1px dashed rgba(232,57,42,.65);border-radius:3px;" +
+    "z-index:2147483645;transition:left .05s,top .05s,width .05s,height .05s;display:none;"
+  );
+  var hoverTag = document.createElement("div");
+  hoverTag.style.cssText =
+    "position:absolute;top:-17px;left:-1px;background:#E8392A;color:#fff;font:bold 9px/15px monospace;" +
+    "padding:0 5px;border-radius:3px 3px 0 0;white-space:nowrap;";
+  hoverBox.appendChild(hoverTag);
+
+  var selBox = mkDiv(
+    "position:fixed;border:2px solid #E8392A;background:rgba(232,57,42,.05);border-radius:3px;" +
+    "z-index:2147483644;display:none;"
+  );
+  var groupBox = mkDiv(
+    "position:fixed;border:2px dashed rgba(34,197,94,.9);background:rgba(34,197,94,.06);border-radius:8px;" +
+    "z-index:2147483644;display:none;"
+  );
+  var resizeHandle = document.createElement("div");
+  resizeHandle.style.cssText =
+    "position:fixed;width:14px;height:14px;border-radius:999px;background:#E8392A;" +
+    "border:2px solid rgba(9,17,27,.95);box-shadow:0 6px 18px rgba(0,0,0,.32);" +
+    "z-index:2147483647;display:none;cursor:nwse-resize;pointer-events:auto;";
+  resizeHandle.setAttribute("data-he-runtime", "resize");
+  document.documentElement.appendChild(resizeHandle);
+
+  var editBox = mkDiv(
+    "position:fixed;border:2px solid #22c55e;border-radius:3px;" +
+    "z-index:2147483643;display:none;"
+  );
+  var editBadge = document.createElement("div");
+  editBadge.style.cssText =
+    "position:absolute;top:-17px;right:0;background:#22c55e;color:#000;font:bold 9px/15px monospace;" +
+    "padding:0 6px;border-radius:3px 3px 0 0;white-space:nowrap;";
+  editBadge.textContent = "Editando - Esc para salir";
+  editBox.appendChild(editBadge);
+
+  var dropLine = mkDiv(
+    "position:fixed;height:2px;background:#E8392A;border-radius:2px;z-index:2147483646;display:none;"
+  );
+  var moveGuideX = document.createElement("div");
+  moveGuideX.style.cssText =
+    "position:fixed;top:0;bottom:0;width:1px;background:rgba(232,57,42,.55);" +
+    "z-index:2147483646;display:none;pointer-events:none;";
+  markRuntime(moveGuideX, "data-he-runtime");
+  document.documentElement.appendChild(moveGuideX);
+
+  var moveGuideY = document.createElement("div");
+  moveGuideY.style.cssText =
+    "position:fixed;left:0;right:0;height:1px;background:rgba(232,57,42,.55);" +
+    "z-index:2147483646;display:none;pointer-events:none;";
+  markRuntime(moveGuideY, "data-he-runtime");
+  document.documentElement.appendChild(moveGuideY);
+
+  var moveHud = document.createElement("div");
+  moveHud.style.cssText =
+    "position:fixed;display:none;align-items:center;gap:6px;padding:5px 8px;border-radius:10px;" +
+    "background:rgba(9,17,27,.96);border:1px solid rgba(255,255,255,.08);color:#e2eaf0;" +
+    "font:600 11px/1.2 system-ui;z-index:2147483647;pointer-events:none;white-space:nowrap;";
+  markRuntime(moveHud, "data-he-runtime");
+  document.documentElement.appendChild(moveHud);
+
+  var selToolbar = document.createElement("div");
+  selToolbar.style.cssText =
+    "position:fixed;display:none;align-items:center;gap:4px;padding:6px;border-radius:14px;" +
+    "background:rgba(9,17,27,.95);border:1px solid rgba(255,255,255,.08);" +
+    "box-shadow:0 12px 28px rgba(0,0,0,.32);z-index:2147483647;pointer-events:auto;";
+  selToolbar.setAttribute("data-he-runtime", "toolbar");
+  selToolbar.innerHTML = [
+    '<button type="button" data-tool="group" style="height:28px;padding:0 10px;border-radius:10px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03);color:#e2eaf0;font:600 11px/28px system-ui;cursor:pointer;">Grupo</button>',
+    '<button type="button" data-tool="edit" style="height:28px;padding:0 10px;border-radius:10px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03);color:#e2eaf0;font:600 11px/28px system-ui;cursor:pointer;">Editar</button>',
+    '<button type="button" data-tool="drag" style="height:28px;padding:0 10px;border-radius:10px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03);color:#e2eaf0;font:600 11px/28px system-ui;cursor:pointer;">Mover</button>',
+    '<button type="button" data-tool="up" style="height:28px;width:28px;border-radius:10px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03);color:#e2eaf0;font:700 12px/28px system-ui;cursor:pointer;">↑</button>',
+    '<button type="button" data-tool="down" style="height:28px;width:28px;border-radius:10px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03);color:#e2eaf0;font:700 12px/28px system-ui;cursor:pointer;">↓</button>',
+    '<button type="button" data-tool="delete" style="height:28px;padding:0 10px;border-radius:10px;border:1px solid rgba(232,57,42,.22);background:rgba(232,57,42,.12);color:#ff8b81;font:700 11px/28px system-ui;cursor:pointer;">Eliminar</button>'
+  ].join("");
+  document.documentElement.appendChild(selToolbar);
+
+  function emitToParent(payload) {
+    try {
+      if (window.frameElement && window.frameElement.__heEditorBridge) {
+        window.frameElement.__heEditorBridge(payload);
+      }
+    } catch (_err) {}
+    try {
+      window.parent.postMessage(payload, "*");
+    } catch (_err) {}
+  }
+
+  function place(overlay, el) {
+    if (!overlay || !el) return;
+    var rect = el.getBoundingClientRect();
+    overlay.style.display = "block";
+    overlay.style.left = rect.left + "px";
+    overlay.style.top = rect.top + "px";
+    overlay.style.width = rect.width + "px";
+    overlay.style.height = rect.height + "px";
+  }
+
+  function placeResizeHandle(el) {
+    if (!el) {
+      resizeHandle.style.display = "none";
+      return;
+    }
+    var rect = el.getBoundingClientRect();
+    resizeHandle.style.display = "block";
+    resizeHandle.style.left = (rect.right - 8) + "px";
+    resizeHandle.style.top = (rect.bottom - 8) + "px";
+  }
+
+  function hideSelectionUi() {
+    selBox.style.display = "none";
+    groupBox.style.display = "none";
+    selToolbar.style.display = "none";
+    resizeHandle.style.display = "none";
+    moveGuideX.style.display = "none";
+    moveGuideY.style.display = "none";
+    moveHud.style.display = "none";
+  }
+
+  function getToolbarButton(tool) {
+    return selToolbar.querySelector("button[data-tool='" + tool + "']");
+  }
+
+  function getUniqueEditableElements(list) {
+    var next = [];
+    (list || []).forEach(function (node) {
+      if (!node || !canEdit(node) || !node.isConnected || isImportRootEl(node)) return;
+      if (next.indexOf(node) === -1) {
+        next.push(node);
+      }
+    });
+    return next;
+  }
+
+  function hasGroupedSelection() {
+    return multiSelectMode && getUniqueEditableElements(multiSelectedEls).length > 1;
+  }
+
+  function getGroupedSelectionBounds(list) {
+    var items = getUniqueEditableElements(list);
+    if (!items.length) return null;
+    var left = Infinity;
+    var top = Infinity;
+    var right = -Infinity;
+    var bottom = -Infinity;
+
+    items.forEach(function (node) {
+      var rect = node.getBoundingClientRect();
+      left = Math.min(left, rect.left);
+      top = Math.min(top, rect.top);
+      right = Math.max(right, rect.right);
+      bottom = Math.max(bottom, rect.bottom);
+    });
+
+    if (!isFinite(left) || !isFinite(top) || !isFinite(right) || !isFinite(bottom)) return null;
+    return {
+      left: left,
+      top: top,
+      width: Math.max(1, right - left),
+      height: Math.max(1, bottom - top)
+    };
+  }
+
+  function placeToolbarForRect(rect) {
+    if (!rect) {
+      selToolbar.style.display = "none";
+      return;
+    }
+    selToolbar.style.display = "flex";
+    var toolbarWidth = selToolbar.offsetWidth || 320;
+    var top = Math.max(10, rect.top - 48);
+    var left = Math.min(
+      window.innerWidth - toolbarWidth - 10,
+      Math.max(10, rect.left + rect.width / 2 - toolbarWidth / 2)
+    );
+    selToolbar.style.top = top + "px";
+    selToolbar.style.left = left + "px";
+  }
+
+  function placeGroupBox(list) {
+    var bounds = getGroupedSelectionBounds(list);
+    if (!bounds) {
+      groupBox.style.display = "none";
+      return null;
+    }
+    groupBox.style.display = "block";
+    groupBox.style.left = bounds.left + "px";
+    groupBox.style.top = bounds.top + "px";
+    groupBox.style.width = bounds.width + "px";
+    groupBox.style.height = bounds.height + "px";
+    return bounds;
+  }
+
+  function clearMultiSelection() {
+    multiSelectedEls = [];
+  }
+
+  function setMultiSelection(list) {
+    var next = getUniqueEditableElements(list);
+    multiSelectedEls = next;
+    if (next.length === 0) {
+      selectedEl = null;
+      return;
+    }
+    if (selectedEl && next.indexOf(selectedEl) !== -1) {
+      return;
+    }
+    selectedEl = next[0];
+  }
+
+  function toggleMultiSelection(el) {
+    if (!canEdit(el) || isImportRootEl(el)) return;
+    var current = getUniqueEditableElements(multiSelectedEls);
+    var index = current.indexOf(el);
+    if (index === -1) {
+      current.push(el);
+    } else {
+      current.splice(index, 1);
+    }
+    setMultiSelection(current);
+  }
+
+  function hideMoveFeedback() {
+    moveGuideX.style.display = "none";
+    moveGuideY.style.display = "none";
+    moveHud.style.display = "none";
+  }
+
+  function updateMoveFeedback(root, left, top, width, height, snapX, snapY) {
+    if (!root) {
+      hideMoveFeedback();
+      return;
+    }
+    var rootRect = root.getBoundingClientRect();
+    var scrollLeft = root.scrollLeft || 0;
+    var scrollTop = root.scrollTop || 0;
+    var viewportLeft = rootRect.left - scrollLeft + left;
+    var viewportTop = rootRect.top - scrollTop + top;
+
+    moveHud.style.display = "flex";
+    moveHud.textContent = Math.round(left) + " x  " + Math.round(top) + " y  •  " + Math.round(width) + " × " + Math.round(height);
+    var hudWidth = moveHud.offsetWidth || 160;
+    var hudLeft = Math.min(window.innerWidth - hudWidth - 10, Math.max(10, viewportLeft + width + 10));
+    var hudTop = Math.max(10, viewportTop - 34);
+    moveHud.style.left = hudLeft + "px";
+    moveHud.style.top = hudTop + "px";
+
+    if (snapX) {
+      moveGuideX.style.display = "block";
+      moveGuideX.style.left = (rootRect.left + rootRect.width / 2) + "px";
+    } else {
+      moveGuideX.style.display = "none";
+    }
+
+    if (snapY) {
+      moveGuideY.style.display = "block";
+      moveGuideY.style.top = (rootRect.top + rootRect.height / 2) + "px";
+    } else {
+      moveGuideY.style.display = "none";
+    }
+  }
+
+  function getLengthValue(el, prop) {
+    if (!el || !el.style) return 0;
+    var inlineValue = el.style[prop];
+    if (inlineValue && inlineValue !== "auto") {
+      var parsedInline = parseFloat(inlineValue);
+      if (!isNaN(parsedInline)) return parsedInline;
+    }
+    var computedValue = window.getComputedStyle(el)[prop];
+    if (!computedValue || computedValue === "auto") return 0;
+    var parsedComputed = parseFloat(computedValue);
+    return isNaN(parsedComputed) ? 0 : parsedComputed;
+  }
+
+  function clampValue(value, min, max) {
+    return Math.min(Math.max(value, min), max);
+  }
+
+  function isImportRootEl(el) {
+    return !!(el && el.getAttribute && (el.getAttribute("data-he-import-root") === "1" || el.id === "he-import-root"));
+  }
+
+  function getEditorRoot(el) {
+    if (!el || !el.closest) return document.body;
+    return el.closest("[data-he-import-root='1']") || document.body;
+  }
+
+  function getFreeMoveRoot(el) {
+    var fallback = getEditorRoot(el);
+    var current = el ? el.parentElement : null;
+
+    while (current && current !== fallback && current !== document.body && current !== document.documentElement) {
+      if (!canEdit(current)) {
+        current = current.parentElement;
+        continue;
+      }
+
+      var tag = (current.tagName || "").toLowerCase();
+      var rect = current.getBoundingClientRect();
+      var childCount = current.children ? current.children.length : 0;
+      var looksLikeContainer = ["div", "section", "article", "main", "header", "footer", "aside", "nav", "form", "fieldset", "ul", "ol", "li", "span"].indexOf(tag) !== -1;
+      var hasRoom = rect.width >= 220 && rect.height >= 120;
+
+      if (
+        looksLikeContainer &&
+        hasRoom &&
+        !isFieldEl(current) &&
+        !isActionableEl(current) &&
+        !isImageLikeEl(current) &&
+        !isTextEl(current) &&
+        (hasVisualChromeEl(current) || childCount > 1)
+      ) {
+        return current;
+      }
+
+      current = current.parentElement;
+    }
+
+    return fallback;
+  }
+
+  function getStoredMoveOffset(el) {
+    if (!el || !el.getAttribute) return { x: 0, y: 0 };
+    var rawX = el.getAttribute("data-he-move-x");
+    var rawY = el.getAttribute("data-he-move-y");
+    var x = parseFloat(rawX != null ? rawX : (el.style && el.style.left) || "0");
+    var y = parseFloat(rawY != null ? rawY : (el.style && el.style.top) || "0");
+    return {
+      x: isNaN(x) ? 0 : x,
+      y: isNaN(y) ? 0 : y,
+    };
+  }
+
+  function isAbsoluteFreeMoveEl(el) {
+    if (!el || !el.style) return false;
+    if (el.getAttribute("data-he-free-move") !== "1") return false;
+    var inlinePosition = (el.style.position || "").toLowerCase();
+    if (inlinePosition === "absolute") return true;
+    return (window.getComputedStyle(el).position || "").toLowerCase() === "absolute";
+  }
+
+  function getBaseTransform(el) {
+    if (!el || !el.getAttribute || !el.style) return "";
+    var stored = el.getAttribute("data-he-base-transform");
+    if (stored != null) {
+      return stored;
+    }
+    var current = el.style.transform && el.style.transform !== "none" ? el.style.transform : "";
+    el.setAttribute("data-he-base-transform", current);
+    return current;
+  }
+
+  function getBasePosition(el) {
+    if (!el || !el.getAttribute || !el.style) return "";
+    var stored = el.getAttribute("data-he-base-position");
+    if (stored != null) {
+      return stored;
+    }
+    var current = el.style.position || "";
+    el.setAttribute("data-he-base-position", current);
+    return current;
+  }
+
+  function applyFreeMoveTransform(el, x, y) {
+    if (!el || !el.style) return;
+    el.setAttribute("data-he-move-x", String(Math.round(x * 100) / 100));
+    el.setAttribute("data-he-move-y", String(Math.round(y * 100) / 100));
+    el.style.left = Math.round(x * 100) / 100 + "px";
+    el.style.top = Math.round(y * 100) / 100 + "px";
+    var base = el.getAttribute ? el.getAttribute("data-he-base-transform") || "" : "";
+    el.style.transform = base && base !== "none" ? base : "";
+  }
+
+  function clearFreeMoveTransform(el) {
+    if (!el || !el.style) return;
+    var base = el.getAttribute ? el.getAttribute("data-he-base-transform") || "" : "";
+    el.removeAttribute && el.removeAttribute("data-he-move-x");
+    el.removeAttribute && el.removeAttribute("data-he-move-y");
+    el.style.left = "";
+    el.style.top = "";
+    el.style.transform = base && base !== "none" ? base : "";
+  }
+
+  function resetFreeMoveState(el) {
+    if (!el || !el.style) return;
+    var basePosition = el.getAttribute ? el.getAttribute("data-he-base-position") || "" : "";
+    clearFreeMoveTransform(el);
+    el.removeAttribute && el.removeAttribute("data-he-free-move");
+    el.removeAttribute && el.removeAttribute("data-he-base-transform");
+    el.removeAttribute && el.removeAttribute("data-he-base-position");
+    el.style.zIndex = "";
+    el.style.willChange = "";
+    el.style.left = "";
+    el.style.top = "";
+    el.style.position = basePosition || "";
+  }
+
+  function copyPersistedLayoutState(fromEl, toEl) {
+    if (!fromEl || !toEl || !toEl.style) return;
+    if (fromEl.dataset && fromEl.dataset.eid) {
+      toEl.dataset.eid = fromEl.dataset.eid;
+    }
+    if (fromEl.getAttribute && fromEl.getAttribute("data-he-icon") && !toEl.getAttribute("data-he-icon")) {
+      toEl.setAttribute("data-he-icon", fromEl.getAttribute("data-he-icon"));
+    }
+    [
+      "data-he-free-move",
+      "data-he-move-x",
+      "data-he-move-y",
+      "data-he-base-position",
+      "data-he-base-transform",
+    ].forEach(function (attrName) {
+      var value = fromEl.getAttribute ? fromEl.getAttribute(attrName) : null;
+      if (value != null) {
+        toEl.setAttribute(attrName, value);
+      }
+    });
+    [
+      "position",
+      "left",
+      "top",
+      "width",
+      "height",
+      "maxWidth",
+      "maxHeight",
+      "minWidth",
+      "minHeight",
+      "fontSize",
+      "color",
+      "zIndex",
+      "margin",
+      "willChange",
+      "isolation",
+      "display",
+    ].forEach(function (prop) {
+      if (fromEl.style && fromEl.style[prop] && (!toEl.style[prop] || toEl.style[prop] === "")) {
+        toEl.style[prop] = fromEl.style[prop];
+      }
+    });
+  }
+
+  function getElementAnchorWithinRoot(el, root, offset) {
+    var currentRoot = root || getEditorRoot(el);
+    if (isAbsoluteFreeMoveEl(el)) {
+      return { left: 0, top: 0 };
+    }
+    var rect = el.getBoundingClientRect();
+    var rootRect = currentRoot.getBoundingClientRect();
+    var moveOffset = offset || getStoredMoveOffset(el);
+    return {
+      left: rect.left - rootRect.left + (currentRoot.scrollLeft || 0) - moveOffset.x,
+      top: rect.top - rootRect.top + (currentRoot.scrollTop || 0) - moveOffset.y,
+    };
+  }
+
+  function getElementPositionWithinRoot(el, root) {
+    var currentRoot = root || getEditorRoot(el);
+    var rect = el.getBoundingClientRect();
+    var rootRect = currentRoot.getBoundingClientRect();
+    return {
+      left: rect.left - rootRect.left + (currentRoot.scrollLeft || 0),
+      top: rect.top - rootRect.top + (currentRoot.scrollTop || 0),
+    };
+  }
+
+  function getFreeMoveBounds(el) {
+    var parent = getFreeMoveRoot(el);
+    var rect = parent.getBoundingClientRect();
+    var width = Math.max(parent.clientWidth || 0, rect.width || 0, 24);
+    var height = Math.max(parent.clientHeight || 0, rect.height || 0, 24);
+    return {
+      parent: parent,
+      width: Math.max(24, width || 0),
+      height: Math.max(24, height || 0)
+    };
+  }
+
+  function normalizeFreeMoveElement(el) {
+    if (!el || !el.style || el.getAttribute("data-he-free-move") !== "1") return false;
+    if (isImportRootEl(el)) {
+      resetFreeMoveState(el);
+      el.style.width = "";
+      el.style.height = "";
+      el.style.maxWidth = "";
+      el.style.maxHeight = "";
+      el.style.margin = "";
+      return true;
+    }
+    var cs = window.getComputedStyle(el);
+    var changed = false;
+
+    ensureFreeMoveStyles(el);
+
+    var bounds = getFreeMoveBounds(el);
+    if (cs.position === "absolute" || (el.style.position || "").toLowerCase() === "absolute") {
+      var legacyLeft = Math.max(0, getLengthValue(el, "left"));
+      var legacyTop = Math.max(0, getLengthValue(el, "top"));
+      var basePosition = el.getAttribute ? el.getAttribute("data-he-base-position") || "" : "";
+      el.style.position = basePosition || "";
+      el.style.left = "";
+      el.style.top = "";
+      el.setAttribute("data-he-move-x", String(legacyLeft));
+      el.setAttribute("data-he-move-y", String(legacyTop));
+      changed = true;
+    }
+    var offset = getStoredMoveOffset(el);
+    var currentWidth = Math.max(18, getLengthValue(el, "width") || el.getBoundingClientRect().width || 18);
+    var currentHeight = Math.max(18, getLengthValue(el, "height") || el.getBoundingClientRect().height || 18);
+    var currentLeft = offset.x;
+    var currentTop = offset.y;
+    var nextWidth = currentWidth;
+    var nextHeight = currentHeight;
+
+    if (isIconCandidate(el)) {
+      var iconMax = Math.max(18, Math.min(bounds.width, bounds.height, 220));
+      var nextIconSize = clampValue(Math.max(currentWidth, currentHeight), 18, iconMax);
+      if (Math.abs(nextIconSize - currentWidth) > 0.5 || Math.abs(nextIconSize - currentHeight) > 0.5) {
+        nextWidth = nextIconSize;
+        nextHeight = nextIconSize;
+        el.style.fontSize = nextIconSize + "px";
+        el.querySelectorAll("svg,[data-he-icon-root='1']").forEach(function (node) {
+          if (node && node.style) {
+            node.style.width = nextIconSize + "px";
+            node.style.height = nextIconSize + "px";
+            node.style.fontSize = nextIconSize + "px";
+          }
+        });
+        changed = true;
+      }
+    } else {
+      var maxWidth = Math.max(24, bounds.width);
+      var maxHeight = Math.max(24, bounds.height);
+      var clampedWidth = clampValue(currentWidth, 24, maxWidth);
+      var clampedHeight = clampValue(currentHeight, 24, maxHeight);
+      if (Math.abs(clampedWidth - currentWidth) > 0.5) {
+        nextWidth = clampedWidth;
+        changed = true;
+      }
+      if (Math.abs(clampedHeight - currentHeight) > 0.5) {
+        nextHeight = clampedHeight;
+        changed = true;
+      }
+    }
+
+    var minLeft = 0;
+    var maxLeft = Math.max(0, bounds.width - nextWidth);
+    var minTop = 0;
+    var maxTop = Math.max(0, bounds.height - nextHeight);
+    var clampedLeft = clampValue(currentLeft, minLeft, maxLeft);
+    var clampedTop = clampValue(currentTop, minTop, maxTop);
+
+    if (Math.abs(clampedLeft - currentLeft) > 0.5) {
+      applyFreeMoveTransform(el, clampedLeft, clampedTop);
+      changed = true;
+    }
+    if (!changed) {
+      applyFreeMoveTransform(el, clampedLeft, clampedTop);
+    }
+    if (Math.abs(nextWidth - currentWidth) > 0.5) {
+      el.style.width = nextWidth + "px";
+      changed = true;
+    }
+    if (Math.abs(nextHeight - currentHeight) > 0.5) {
+      el.style.height = nextHeight + "px";
+      changed = true;
+    }
+    return changed;
+  }
+
+  function normalizeStandaloneIconElement(el) {
+    if (!el || !el.style || !isIconCandidate(el)) return false;
+    var bounds = getFreeMoveBounds(el);
+    var rect = el.getBoundingClientRect();
+    var iconMax = Math.max(18, Math.min(bounds.width, bounds.height, 220));
+    var nextIconSize = clampValue(Math.max(rect.width, rect.height, getNumericComputed(el, "fontSize", 18)), 12, iconMax);
+    var changed = false;
+
+    if (rect.width > iconMax + 1 || rect.height > iconMax + 1 || getNumericComputed(el, "fontSize", 18) > iconMax + 1) {
+      el.style.width = nextIconSize + "px";
+      el.style.height = nextIconSize + "px";
+      el.style.fontSize = nextIconSize + "px";
+      el.style.maxWidth = nextIconSize + "px";
+      el.style.maxHeight = nextIconSize + "px";
+      el.querySelectorAll("svg,[data-he-icon-root='1']").forEach(function (node) {
+        if (node && node.style) {
+          node.style.width = nextIconSize + "px";
+          node.style.height = nextIconSize + "px";
+          node.style.fontSize = nextIconSize + "px";
+          node.style.maxWidth = nextIconSize + "px";
+          node.style.maxHeight = nextIconSize + "px";
+        }
+      });
+      changed = true;
+    }
+
+    return changed;
+  }
+
+  function ensureRootMoveCapacity(root, desiredLeft, desiredTop, width, height) {
+    return;
+  }
+
+  function recalculateRootMoveCapacity(root) {
+    if (!root || !root.style || !root.querySelectorAll) return;
+    root.style.minHeight = "";
+  }
+
+  function normalizePersistedEditorLayout() {
+    var changed = false;
+    document.querySelectorAll("[data-he-free-move='1']").forEach(function (node) {
+      if (node && normalizeFreeMoveElement(node)) {
+        changed = true;
+      }
+    });
+    document.querySelectorAll("[data-he-icon-root='1'], [data-he-icon], .he-inline-icon, .lucide").forEach(function (node) {
+      if (node && normalizeStandaloneIconElement(node)) {
+        changed = true;
+      }
+    });
+    return changed;
+  }
+
+  function hasMeaningfulContent(el) {
+    if (!el) return false;
+    var text = ((el.innerText || el.textContent || "") + "").replace(/\s+/g, " ").trim();
+    if (text.length > 0) return true;
+    if (el.querySelector && el.querySelector("input,textarea,select,button,a,img,svg,video,iframe,canvas")) return true;
+    return false;
+  }
+
+  function cleanupLayout(rootEl) {
+    var scope = rootEl && rootEl.querySelectorAll ? rootEl : document.body;
+    var changed = false;
+
+    if (scope && scope.style) {
+      if (scope.style.height || scope.style.minHeight || scope.style.maxHeight) {
+        scope.style.height = "";
+        scope.style.minHeight = "";
+        scope.style.maxHeight = "";
+        changed = true;
+      }
+    }
+
+    if (scope.querySelectorAll) {
+      scope.querySelectorAll("*").forEach(function (node) {
+        if (!node || !node.style || !canEdit(node)) return;
+
+        if (node.getAttribute("data-he-free-move") === "1") {
+          if (normalizeFreeMoveElement(node)) changed = true;
+        }
+
+        if (isIconCandidate(node)) {
+          if (normalizeStandaloneIconElement(node)) changed = true;
+        }
+
+        var rect = node.getBoundingClientRect();
+        var isSpacerLike =
+          !hasMeaningfulContent(node) &&
+          !node.children.length &&
+          rect.height > 72;
+
+        if (isSpacerLike) {
+          node.style.height = "";
+          node.style.minHeight = "";
+          node.style.maxHeight = "";
+          node.style.marginTop = "";
+          node.style.marginBottom = "";
+          node.style.paddingTop = "";
+          node.style.paddingBottom = "";
+          changed = true;
+        }
+      });
+    }
+
+    if (changed) {
+      recalculateRootMoveCapacity(scope);
+      reportHeight();
+    }
+    return changed;
+  }
+
+  function ensureFreeMoveStyles(el) {
+    if (!el || !el.style) return;
+    if (isImportRootEl(el)) return;
+    var rect = el.getBoundingClientRect();
+    var cs = window.getComputedStyle(el);
+    el.setAttribute("data-he-free-move", "1");
+    var root = getFreeMoveRoot(el);
+    var rootStyle = window.getComputedStyle(root);
+    if (cs.display === "inline") {
+      el.style.display = "inline-block";
+    }
+    if (rootStyle.position === "static" && !root.style.position) {
+      root.style.position = "relative";
+    }
+    if (rootStyle.overflow === "hidden" || rootStyle.overflow === "clip") {
+      root.style.overflow = "visible";
+    }
+    if (!root.style.isolation) {
+      root.style.isolation = "isolate";
+    }
+    getBaseTransform(el);
+    getBasePosition(el);
+    var currentOffset = getStoredMoveOffset(el);
+    if (!isAbsoluteFreeMoveEl(el)) {
+      var currentPosition = getElementPositionWithinRoot(el, root);
+      el.style.position = "absolute";
+      el.style.left = currentPosition.left + "px";
+      el.style.top = currentPosition.top + "px";
+      if (!el.style.width || el.style.width === "auto") {
+        el.style.width = Math.max(18, rect.width) + "px";
+      }
+      if ((!el.style.height || el.style.height === "auto") && (canResizeFreely(el) || isIconCandidate(el))) {
+        el.style.height = Math.max(18, rect.height) + "px";
+      }
+      currentOffset = { x: currentPosition.left, y: currentPosition.top };
+      el.setAttribute("data-he-move-x", String(currentPosition.left));
+      el.setAttribute("data-he-move-y", String(currentPosition.top));
+    }
+    if (!el.style.flex) {
+      el.style.flex = "none";
+    }
+    if (!el.style.alignSelf) {
+      el.style.alignSelf = "flex-start";
+    }
+    if (!el.style.zIndex || el.style.zIndex === "auto") {
+      el.style.zIndex = "2147483000";
+    }
+    if (!el.hasAttribute("data-he-move-x")) {
+      el.setAttribute("data-he-move-x", "0");
+    }
+    if (!el.hasAttribute("data-he-move-y")) {
+      el.setAttribute("data-he-move-y", "0");
+    }
+    if (!el.style.isolation) {
+      el.style.isolation = "isolate";
+    }
+    applyFreeMoveTransform(el, currentOffset.x, currentOffset.y);
+    el.style.willChange = "left, top, width, height";
+    promoteFreeMoveAncestors(el);
+  }
+
+  function promoteFreeMoveAncestors(el) {
+    var current = el ? el.parentElement : null;
+    var depth = 0;
+
+    while (current && current !== document.body && current !== document.documentElement && depth < 8) {
+      if (!canEdit(current)) {
+        current = current.parentElement;
+        depth += 1;
+        continue;
+      }
+
+      var cs = window.getComputedStyle(current);
+      var overflowX = cs.overflowX || "";
+      var overflowY = cs.overflowY || "";
+      var overflow = cs.overflow || "";
+      var clipsChildren =
+        overflow === "hidden" ||
+        overflow === "clip" ||
+        overflowX === "hidden" ||
+        overflowX === "clip" ||
+        overflowY === "hidden" ||
+        overflowY === "clip";
+
+      if (clipsChildren) {
+        current.style.overflow = "visible";
+      }
+
+      if (cs.position === "static" && !current.style.position) {
+        current.style.position = "relative";
+      }
+
+      if ((!current.style.zIndex || current.style.zIndex === "auto") && (!cs.zIndex || cs.zIndex === "auto")) {
+        current.style.zIndex = "1";
+      }
+
+      if (!current.style.isolation) {
+        current.style.isolation = "isolate";
+      }
+
+      current = current.parentElement;
+      depth += 1;
+    }
+  }
+
+  function syncMoveUi() {
+    var groupButton = getToolbarButton("group");
+    var moveButton = getToolbarButton("drag");
+    var upButton = getToolbarButton("up");
+    var downButton = getToolbarButton("down");
+    var deleteButton = getToolbarButton("delete");
+    var editButton = getToolbarButton("edit");
+    var protectedSelection = !!(selectedEl && isImportRootEl(selectedEl));
+    var grouped = hasGroupedSelection();
+    var movableSelection = !!(selectedEl && canUseFreeMove(selectedEl));
+    var resizableSelection = !!(selectedEl && canResizeFreely(selectedEl));
+    var active = !!(freeMoveEl && ((freeMoveIsGroup && grouped) || (!freeMoveIsGroup && selectedEl && freeMoveEl === selectedEl)));
+    if (groupButton) {
+      groupButton.disabled = protectedSelection;
+      groupButton.style.opacity = protectedSelection ? ".35" : "1";
+      groupButton.style.borderColor = multiSelectMode ? "rgba(34,197,94,.28)" : "rgba(255,255,255,.08)";
+      groupButton.style.background = multiSelectMode ? "rgba(34,197,94,.14)" : "rgba(255,255,255,.03)";
+      groupButton.style.color = multiSelectMode ? "#bbf7d0" : "#e2eaf0";
+    }
+    if (editButton) {
+      editButton.disabled = protectedSelection || grouped;
+      editButton.style.opacity = protectedSelection || grouped ? ".35" : "1";
+    }
+    if (moveButton) {
+      moveButton.textContent = active ? "Soltar" : grouped ? "Mover grupo" : "Mover";
+      moveButton.disabled = protectedSelection || (!grouped && !movableSelection);
+      moveButton.style.opacity = protectedSelection || (!grouped && !movableSelection) ? ".35" : "1";
+      moveButton.style.borderColor = active ? "rgba(232,57,42,.22)" : "rgba(255,255,255,.08)";
+      moveButton.style.background = active ? "rgba(232,57,42,.12)" : "rgba(255,255,255,.03)";
+      moveButton.style.color = active ? "#ffb2aa" : "#e2eaf0";
+    }
+    if (upButton) {
+      upButton.disabled = protectedSelection || grouped;
+      upButton.style.opacity = protectedSelection || grouped ? ".35" : "1";
+    }
+    if (downButton) {
+      downButton.disabled = protectedSelection || grouped;
+      downButton.style.opacity = protectedSelection || grouped ? ".35" : "1";
+    }
+    if (deleteButton) {
+      deleteButton.disabled = protectedSelection;
+      deleteButton.style.opacity = protectedSelection ? ".35" : "1";
+    }
+    selBox.style.pointerEvents = active && !grouped ? "auto" : "none";
+    selBox.style.cursor = active && !grouped ? "move" : "default";
+    groupBox.style.pointerEvents = active && grouped ? "auto" : "none";
+    groupBox.style.cursor = active && grouped ? "move" : "default";
+    resizeHandle.style.opacity = selectedEl && !protectedSelection && !grouped && resizableSelection ? "1" : "0";
+    resizeHandle.style.pointerEvents = selectedEl && !protectedSelection && !grouped && resizableSelection ? "auto" : "none";
+  }
+
+  function placeToolbar(el) {
+    if (!el) {
+      placeToolbarForRect(null);
+      return;
+    }
+    placeToolbarForRect(el.getBoundingClientRect());
+  }
+
+  function setFreeMove(el, asGroup) {
+    freeMoveEl = el || null;
+    freeMoveIsGroup = !!asGroup;
+    if (freeMoveEl) {
+      if (freeMoveIsGroup && hasGroupedSelection()) {
+        getUniqueEditableElements(multiSelectedEls).forEach(function (node) {
+          ensureFreeMoveStyles(node);
+        });
+      } else {
+        ensureFreeMoveStyles(freeMoveEl);
+      }
+    }
+    syncMoveUi();
+  }
+
+  function canEdit(el) {
+    if (!el || el === document.body || el === document.documentElement) return false;
+    if (el.closest && el.closest("[data-he-runtime],[data-he-editor-overlay]")) return false;
+    var tag = (el.tagName || "").toLowerCase();
+    return EID_SKIP.indexOf(tag) === -1;
+  }
+
+  function isRuntimeUiTarget(target) {
+    return !!(target && target.closest && target.closest("[data-he-runtime],[data-he-editor-overlay]"));
+  }
+
+  function hasCompactText(el) {
+    if (!el) return true;
+    var text = ((el.innerText || el.textContent || "") + "").replace(/\\s+/g, " ").trim();
+    return text.length <= 2;
+  }
+
+  function normalizeTextValue(value) {
+    return ((value || "") + "").replace(/\\s+/g, " ").trim();
+  }
+
+  function getVisibleTextContent(el) {
+    if (!el) return "";
+    return normalizeTextValue(el.innerText || el.textContent || "");
+  }
+
+  function getOwnTextContent(el) {
+    if (!el || !el.childNodes) return "";
+    var parts = [];
+    for (var index = 0; index < el.childNodes.length; index += 1) {
+      var child = el.childNodes[index];
+      if (child && child.nodeType === 3 && child.textContent) {
+        parts.push(child.textContent);
+      }
+    }
+    return normalizeTextValue(parts.join(" "));
+  }
+
+  function hasVisualChromeEl(el) {
+    if (!el || !el.style) return false;
+    var cs = window.getComputedStyle(el);
+    var bg = cs.backgroundColor || "";
+    var borderTop = parseFloat(cs.borderTopWidth || "0");
+    var borderRight = parseFloat(cs.borderRightWidth || "0");
+    var borderBottom = parseFloat(cs.borderBottomWidth || "0");
+    var borderLeft = parseFloat(cs.borderLeftWidth || "0");
+    var radius = parseFloat(cs.borderRadius || "0");
+    return (
+      (bg && bg !== "transparent" && bg !== "rgba(0, 0, 0, 0)") ||
+      borderTop > 0 ||
+      borderRight > 0 ||
+      borderBottom > 0 ||
+      borderLeft > 0 ||
+      radius > 0 ||
+      (cs.boxShadow && cs.boxShadow !== "none")
+    );
+  }
+
+  function hasNestedComplexContent(el) {
+    return !!(el && el.querySelector && el.querySelector("input,textarea,select,button,a,img,video,iframe,table,ul,ol"));
+  }
+
+  function isIconStructuralTag(tag) {
+    return ICON_SHAPE_TAGS.indexOf(tag) !== -1 || tag === "svg";
+  }
+
+  function isInsideIconRoot(el) {
+    if (!el || !el.closest) return false;
+    var host = el.closest("[data-he-icon-root='1']");
+    return !!host && host !== el;
+  }
+
+  function inferEditorNodeType(el) {
+    if (!el || !el.tagName) return "container";
+    var tag = (el.tagName || "").toLowerCase();
+    var className = typeof el.className === "string" ? el.className.toLowerCase() : "";
+    var text = ((el.textContent || "") + "").replace(/\\s+/g, " ").trim();
+
+    if (
+      el.getAttribute("data-he-icon-root") === "1" ||
+      !!el.getAttribute("data-he-icon") ||
+      className.indexOf("he-inline-icon") !== -1 ||
+      className.indexOf("lucide") !== -1
+    ) {
+      return "icon";
+    }
+
+    if (tag === "svg" && !isInsideIconRoot(el)) {
+      return "icon";
+    }
+
+    if (tag === "img") return "image";
+    if (tag === "input" || tag === "textarea" || tag === "select") return "field";
+
+    if (
+      tag === "button" ||
+      tag === "a" ||
+      el.getAttribute("role") === "button" ||
+      el.hasAttribute("onclick")
+    ) {
+      return "button";
+    }
+
+    if (
+      ["p", "h1", "h2", "h3", "h4", "h5", "h6", "span", "label", "small", "strong", "em", "blockquote", "li"].indexOf(tag) !== -1 &&
+      text.length > 0
+    ) {
+      return "text";
+    }
+
+    return "container";
+  }
+
+  function markEditableNodeTypes(root) {
+    var scope = root || document.body;
+    if (!scope || !scope.querySelectorAll) return;
+    scope.querySelectorAll("*").forEach(function (node) {
+      if (!node || !node.tagName) return;
+      var tag = (node.tagName || "").toLowerCase();
+      if (isInsideIconRoot(node) && isIconStructuralTag(tag)) {
+        node.removeAttribute("data-he-node-type");
+        return;
+      }
+      if (!node || !node.dataset || !node.dataset.eid) return;
+      node.setAttribute("data-he-node-type", inferEditorNodeType(node));
+    });
+  }
+
+  function getNodeType(el) {
+    if (!el || !el.getAttribute) return null;
+    return el.getAttribute("data-he-node-type") || inferEditorNodeType(el);
+  }
+
+  function getEditableOwner(el) {
+    if (!el || !(el instanceof Element)) return null;
+    var iconHost = getIconHost(el);
+    if (iconHost) return iconHost;
+    return el.closest("[data-eid][data-he-node-type]") || el.closest("[data-eid]") || null;
+  }
+
+  function getPreferredSelectionTarget(raw) {
+    if (!raw || !(raw instanceof Element)) return null;
+    var icon = getIconHost(raw);
+    if (icon && canEdit(icon)) return icon;
+    var text = raw.closest("[data-he-node-type='text']");
+    if (text && canEdit(text)) return text;
+    var field = raw.closest("[data-he-node-type='field']");
+    if (field && canEdit(field)) return field;
+    var button = raw.closest("[data-he-node-type='button']");
+    if (button && canEdit(button)) return button;
+    var owner = getEditableOwner(raw);
+    return owner && canEdit(owner) ? owner : null;
+  }
+
+  function canUseFreeMove(el) {
+    var kind = getNodeType(el);
+    if (kind === "icon" || kind === "text" || kind === "button" || kind === "image") return true;
+    if (kind === "container" && !isImportRootEl(el)) return true;
+    return false;
+  }
+
+  function canResizeFreely(el) {
+    var kind = getNodeType(el);
+    return kind === "icon" || kind === "button" || kind === "image" || kind === "container";
+  }
+
+  function isIconCandidate(el) {
+    if (!el || !el.tagName) return false;
+    if (getNodeType(el) === "icon") return true;
+    var tag = (el.tagName || "").toLowerCase();
+    var cls = typeof el.className === "string" ? el.className.toLowerCase() : "";
+    if (tag === "svg" && !isInsideIconRoot(el)) return true;
+    if (ICON_SHAPE_TAGS.indexOf(tag) !== -1 && !isInsideIconRoot(el)) return true;
+    if (el.getAttribute("data-he-icon-root") === "1" || !!el.getAttribute("data-he-icon")) return true;
+    if (cls.indexOf("he-inline-icon") !== -1 || cls.indexOf("lucide") !== -1) return true;
+    if ((tag === "span" || tag === "i" || tag === "em" || tag === "strong" || tag === "small" || tag === "div") && getDirectIconChild(el) && hasCompactText(el)) return true;
+    return false;
+  }
+
+  function getIconHost(el) {
+    if (!el || !(el instanceof Element)) return null;
+    return el.closest("[data-he-icon-root='1']") || el.closest("[data-he-node-type='icon']");
+  }
+
+  function getDirectIconChild(el) {
+    if (!el || !el.children) return null;
+    for (var index = 0; index < el.children.length; index += 1) {
+      var child = el.children[index];
+      if (isIconCandidate(child) && canEdit(child)) return child;
+    }
+    return null;
+  }
+
+  function looksLikeButtonContainerEl(el) {
+    if (!el || !el.tagName || isImportRootEl(el) || isFieldEl(el) || isImageEl(el) || isIconCandidate(el) || isActionableEl(el)) return false;
+    var tag = (el.tagName || "").toLowerCase();
+    if (["div", "span", "label", "li", "p"].indexOf(tag) === -1) return false;
+    if (hasNestedComplexContent(el)) return false;
+    if (el.children && el.children.length > 4) return false;
+    var text = getVisibleTextContent(el);
+    if (!text || text.length > 90) return false;
+    var cs = window.getComputedStyle(el);
+    var display = (cs.display || "").toLowerCase();
+    var inlineLike = display.indexOf("inline") !== -1 || display.indexOf("flex") !== -1 || display.indexOf("grid") !== -1;
+    var clickable = cs.cursor === "pointer" || el.getAttribute("role") === "button" || el.tabIndex >= 0;
+    var hasIcon = !!getDirectIconChild(el) || !!(el.querySelector && el.querySelector("[data-he-icon],[data-he-icon-root='1'],svg,.he-inline-icon,.lucide"));
+    return (hasVisualChromeEl(el) || hasIcon) && (inlineLike || clickable);
+  }
+
+  function looksLikeTextContainerEl(el) {
+    if (!el || !el.tagName || isImportRootEl(el) || isFieldEl(el) || isImageEl(el) || isIconCandidate(el) || isActionableEl(el) || looksLikeButtonContainerEl(el)) return false;
+    var tag = (el.tagName || "").toLowerCase();
+    if (["div", "span", "label", "li", "p"].indexOf(tag) === -1) return false;
+    if (hasNestedComplexContent(el)) return false;
+    if (el.children && el.children.length > 3) return false;
+    var directText = getOwnTextContent(el);
+    var text = directText || getVisibleTextContent(el);
+    if (!text || text.length > 180) return false;
+    return true;
+  }
+
+  function isPointNearRect(rect, clientX, clientY, padding) {
+    var pad = typeof padding === "number" ? padding : 0;
+    return (
+      clientX >= rect.left - pad &&
+      clientX <= rect.right + pad &&
+      clientY >= rect.top - pad &&
+      clientY <= rect.bottom + pad
+    );
+  }
+
+  function getRectDistanceToPoint(rect, clientX, clientY) {
+    var dx = 0;
+    var dy = 0;
+    if (clientX < rect.left) dx = rect.left - clientX;
+    else if (clientX > rect.right) dx = clientX - rect.right;
+    if (clientY < rect.top) dy = rect.top - clientY;
+    else if (clientY > rect.bottom) dy = clientY - rect.bottom;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+
+  function findBestInlineIconTarget(source, clientX, clientY) {
+    if (!source) return null;
+    var pool = [];
+    var seen = [];
+
+    function pushCandidate(node) {
+      if (!node || !canEdit(node) || seen.indexOf(node) !== -1) return;
+      seen.push(node);
+      pool.push(node);
+    }
+
+    pushCandidate(source);
+    if (source.querySelectorAll) {
+      source.querySelectorAll("[data-he-icon-root='1'],[data-he-icon],svg,.he-inline-icon,.lucide").forEach(function (node) {
+        pushCandidate(node);
+      });
+    }
+
+    var best = null;
+    var bestScore = Infinity;
+
+    for (var index = 0; index < pool.length; index += 1) {
+      var candidate = pool[index];
+      var host = getIconHost(candidate) || candidate;
+      if (!host || !canEdit(host)) continue;
+      var rect = host.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) continue;
+      if (!isPointNearRect(rect, clientX, clientY, 10)) continue;
+      var distance = getRectDistanceToPoint(rect, clientX, clientY);
+      var area = Math.max(1, rect.width * rect.height);
+      var score = distance * 1000 + area;
+      if (score < bestScore) {
+        bestScore = score;
+        best = host;
+      }
+    }
+
+    return best;
+  }
+
+  function findBestInlineTextTarget(source, clientX, clientY) {
+    if (!source || !canEdit(source)) return null;
+    var pool = [];
+    var seen = [];
+
+    function pushCandidate(node) {
+      if (!node || !canEdit(node) || seen.indexOf(node) !== -1) return;
+      seen.push(node);
+      pool.push(node);
+    }
+
+    function isTextLikeCandidate(node) {
+      return !!node && canEdit(node) && (isTextEl(node) || looksLikeTextContainerEl(node) || looksLikeButtonContainerEl(node));
+    }
+
+    pushCandidate(source);
+    if (source.querySelectorAll) {
+      source.querySelectorAll(TEXT_TAGS.join(",") + ",div,span,label,li").forEach(function (node) {
+        if (isTextLikeCandidate(node)) {
+          pushCandidate(node);
+        }
+      });
+    }
+
+    var best = null;
+    var bestScore = Infinity;
+
+    for (var index = 0; index < pool.length; index += 1) {
+      var candidate = pool[index];
+      if (!isTextLikeCandidate(candidate)) continue;
+      var rect = candidate.getBoundingClientRect();
+      if (rect.width < 2 || rect.height < 2) continue;
+      if (!isPointNearRect(rect, clientX, clientY, 8)) continue;
+      var distance = getRectDistanceToPoint(rect, clientX, clientY);
+      var area = Math.max(1, rect.width * rect.height);
+      var score = distance * 1000 + area;
+      if (score < bestScore) {
+        bestScore = score;
+        best = candidate;
+      }
+    }
+
+    return best;
+  }
+
+  function normalizeSelectionTarget(el) {
+    if (!el || !canEdit(el)) return el;
+    var typedTarget = getPreferredSelectionTarget(el);
+    if (typedTarget && canEdit(typedTarget)) {
+      el = typedTarget;
+    }
+    var tag = (el.tagName || "").toLowerCase();
+    var iconHost = getIconHost(el);
+
+    if (ICON_SHAPE_TAGS.indexOf(tag) !== -1) {
+      if (iconHost && canEdit(iconHost)) return iconHost;
+    }
+
+    if (tag === "svg" && iconHost && canEdit(iconHost)) {
+      return iconHost;
+    }
+
+    if (isIconCandidate(el)) {
+      if (
+        el.getAttribute("data-he-icon-root") === "1" ||
+        !!el.getAttribute("data-he-icon") ||
+        (typeof el.className === "string" && el.className.toLowerCase().indexOf("he-inline-icon") !== -1)
+      ) {
+        return el;
+      }
+      if (iconHost && iconHost !== el && canEdit(iconHost)) return iconHost;
+      return el;
+    }
+
+    var nestedIcon = getDirectIconChild(el);
+    if (nestedIcon && hasCompactText(el)) {
+      var nestedHost = getIconHost(nestedIcon);
+      return nestedHost && canEdit(nestedHost) ? nestedHost : nestedIcon;
+    }
+
+    return el;
+  }
+
+  function isFieldEl(el) {
+    if (!el || !el.tagName) return false;
+    var tag = (el.tagName || "").toLowerCase();
+    return tag === "input" || tag === "textarea" || tag === "select";
+  }
+
+  function isImageEl(el) {
+    return !!el && !!el.tagName && (el.tagName || "").toLowerCase() === "img";
+  }
+
+  function getSelectionTargetFromPoint(clientX, clientY, fallback) {
+    var preferredFallback = getPreferredSelectionTarget(fallback);
+    if (preferredFallback && canEdit(preferredFallback)) {
+      fallback = preferredFallback;
+    }
+
+    var earlyIcon = null;
+    if (typeof document.elementsFromPoint === "function") {
+      var rawStack = document.elementsFromPoint(clientX, clientY) || [];
+      for (var rawIndex = 0; rawIndex < rawStack.length; rawIndex += 1) {
+        var rawNode = rawStack[rawIndex];
+        if (!canEdit(rawNode)) continue;
+        var preferred = getPreferredSelectionTarget(rawNode);
+        if (preferred && canEdit(preferred) && getNodeType(preferred) === "icon") {
+          return normalizeSelectionTarget(preferred);
+        }
+        earlyIcon = findBestInlineIconTarget(rawNode, clientX, clientY);
+        if (earlyIcon && canEdit(earlyIcon)) {
+          return normalizeSelectionTarget(earlyIcon);
+        }
+      }
+    }
+
+    var fallbackIcon = findBestInlineIconTarget(fallback, clientX, clientY);
+    if (fallbackIcon && canEdit(fallbackIcon)) {
+      return normalizeSelectionTarget(fallbackIcon);
+    }
+
+    var earlyText = null;
+    if (typeof document.elementsFromPoint === "function") {
+      var textStack = document.elementsFromPoint(clientX, clientY) || [];
+      for (var textIndex = 0; textIndex < textStack.length; textIndex += 1) {
+        var textNode = textStack[textIndex];
+        if (!canEdit(textNode)) continue;
+        var preferredText = getPreferredSelectionTarget(textNode);
+        if (preferredText && canEdit(preferredText) && getNodeType(preferredText) !== "container") {
+          return normalizeSelectionTarget(preferredText);
+        }
+        earlyText = findBestInlineTextTarget(textNode, clientX, clientY);
+        if (earlyText && canEdit(earlyText)) {
+          return normalizeSelectionTarget(earlyText);
+        }
+      }
+    }
+
+    var fallbackText = findBestInlineTextTarget(fallback, clientX, clientY);
+    if (fallbackText && canEdit(fallbackText)) {
+      return normalizeSelectionTarget(fallbackText);
+    }
+
+    var normalized = [];
+    if (typeof document.elementsFromPoint === "function") {
+      var stack = document.elementsFromPoint(clientX, clientY) || [];
+      for (var index = 0; index < stack.length; index += 1) {
+        var node = stack[index];
+        if (!canEdit(node)) continue;
+        var resolved = normalizeSelectionTarget(node);
+        if (!resolved || !canEdit(resolved)) continue;
+        if (normalized.indexOf(resolved) === -1) {
+          normalized.push(resolved);
+        }
+      }
+    }
+
+    var fallbackTarget = normalizeSelectionTarget(fallback);
+    if (fallbackTarget && canEdit(fallbackTarget) && normalized.indexOf(fallbackTarget) === -1) {
+      normalized.push(fallbackTarget);
+    }
+
+    var best = null;
+    var bestScore = -999999;
+
+    for (var scoreIndex = 0; scoreIndex < normalized.length; scoreIndex += 1) {
+      var candidate = normalized[scoreIndex];
+      if (!candidate || !canEdit(candidate)) continue;
+      var score = 0;
+      var nodeType = getNodeType(candidate);
+      var rect = candidate.getBoundingClientRect();
+      var area = Math.max(1, (rect.width || 1) * (rect.height || 1));
+      if (isImportRootEl(candidate)) score -= 100000;
+      if (nodeType === "icon" || isIconCandidate(candidate)) score += 900;
+      else if (nodeType === "image" || isImageEl(candidate)) score += 820;
+      else if (nodeType === "field" || isFieldEl(candidate)) score += 780;
+      else if (nodeType === "button" || isActionableEl(candidate) || looksLikeButtonContainerEl(candidate)) score += 740;
+      else if (nodeType === "text" || isTextEl(candidate) || looksLikeTextContainerEl(candidate)) score += 700;
+      else score += 500;
+      score += Math.max(0, 320 - Math.log(area + 1) * 26);
+
+      var depth = 0;
+      var current = candidate;
+      while (current && current !== document.body && current !== document.documentElement) {
+        depth += 1;
+        current = current.parentElement;
+      }
+      score += Math.min(depth, 24) * 3;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = candidate;
+      }
+    }
+
+    if (best) {
+      return best;
+    }
+
+    for (var contentIndex = 0; contentIndex < normalized.length; contentIndex += 1) {
+      if (!isImportRootEl(normalized[contentIndex])) return normalized[contentIndex];
+    }
+
+    return normalized[0] || fallbackTarget || fallback;
+  }
+
+  function isTextEl(el) {
+    return TEXT_TAGS.indexOf((el.tagName || "").toLowerCase()) !== -1;
+  }
+
+  function isLinkEl(el) {
+    return (el.tagName || "").toLowerCase() === "a";
+  }
+
+  function isButtonEl(el) {
+    var tag = (el.tagName || "").toLowerCase();
+    return tag === "button" || el.getAttribute("role") === "button" || el.getAttribute("type") === "button" || el.getAttribute("type") === "submit";
+  }
+
+  function isActionableEl(el) {
+    return isLinkEl(el) || isButtonEl(el);
+  }
+
+  function isNativeInteractiveTarget(el) {
+    if (!el || !el.tagName) return false;
+    var tag = (el.tagName || "").toLowerCase();
+    return (
+      tag === "input" ||
+      tag === "textarea" ||
+      tag === "select" ||
+      tag === "option" ||
+      tag === "button" ||
+      tag === "a" ||
+      tag === "label" ||
+      el.getAttribute("contenteditable") === "true"
+    );
+  }
+
+  function isImageLikeEl(el) {
+    return isImageEl(el) || isIconCandidate(el);
+  }
+
+  function getNumericComputed(el, prop, fallback) {
+    var value = window.getComputedStyle(el)[prop];
+    var parsed = parseFloat(value || "");
+    return isNaN(parsed) ? fallback : parsed;
+  }
+
+  function applyStyleQuery(el, selector, prop, value) {
+    if (!el || !selector) return;
+    if (el.matches && el.matches(selector) && el.style) {
+      el.style[prop] = value;
+    }
+    el.querySelectorAll(selector).forEach(function (node) {
+      if (node && node.style) {
+        node.style[prop] = value;
+      }
+    });
+  }
+
+  function applyIconPatch(el, patch) {
+    if (!el || !canEdit(el)) return null;
+    var host = getIconHost(el) || el;
+    var target = host && canEdit(host) ? host : el;
+    if (target.setAttribute) {
+      target.setAttribute("data-he-node-type", "icon");
+    }
+    if (target.style) {
+      target.style.display = "inline-flex";
+      target.style.alignItems = "center";
+      target.style.justifyContent = "center";
+      target.style.verticalAlign = "middle";
+      target.style.lineHeight = "0";
+      target.style.flexShrink = "0";
+    }
+    var svgNodes = [];
+
+    if (target.tagName && target.tagName.toLowerCase() === "svg") {
+      svgNodes.push(target);
+    }
+    if (target.querySelectorAll) {
+      target.querySelectorAll("svg").forEach(function (node) {
+        if (node && svgNodes.indexOf(node) === -1) {
+          svgNodes.push(node);
+        }
+      });
+    }
+
+    if (patch.color) {
+      if (target.style) {
+        target.style.color = patch.color;
+      }
+      if (target.setAttribute) {
+        target.setAttribute("data-he-icon-color", patch.color);
+      }
+      svgNodes.forEach(function (svg) {
+        if (!svg || !svg.style) return;
+        svg.style.display = "block";
+        svg.style.color = patch.color;
+        svg.style.stroke = "currentColor";
+        svg.style.fill = "none";
+        if (svg.setAttribute) {
+          svg.setAttribute("stroke", "currentColor");
+          svg.setAttribute("fill", "none");
+          svg.setAttribute("color", patch.color);
+        }
+      });
+      if (target.querySelectorAll) {
+        target.querySelectorAll("path,rect,circle,line,polyline,polygon,ellipse,g,use").forEach(function (node) {
+          if (!node || !node.style) return;
+          node.style.stroke = "currentColor";
+          node.style.color = patch.color;
+          node.style.fill = "none";
+          if (node.setAttribute) {
+            node.setAttribute("stroke", "currentColor");
+            node.setAttribute("fill", "none");
+          }
+        });
+      }
+    }
+
+    if (patch.size) {
+      var rawSize = parseFloat(String(patch.size || ""));
+      var nextSize = clampValue(isNaN(rawSize) ? 20 : rawSize, 12, 220);
+      var nextSizePx = nextSize + "px";
+      if (target.style) {
+        target.style.fontSize = nextSizePx;
+        target.style.width = nextSizePx;
+        target.style.height = nextSizePx;
+        target.style.maxWidth = nextSizePx;
+        target.style.maxHeight = nextSizePx;
+        target.style.minWidth = nextSizePx;
+        target.style.minHeight = nextSizePx;
+      }
+      if (target.setAttribute) {
+        target.setAttribute("data-he-icon-size", String(nextSize));
+      }
+      svgNodes.forEach(function (svg) {
+        if (!svg || !svg.style) return;
+        svg.style.width = nextSizePx;
+        svg.style.height = nextSizePx;
+        svg.style.maxWidth = nextSizePx;
+        svg.style.maxHeight = nextSizePx;
+        svg.style.minWidth = nextSizePx;
+        svg.style.minHeight = nextSizePx;
+        svg.style.fontSize = nextSizePx;
+        if (svg.setAttribute) {
+          svg.setAttribute("width", String(nextSize));
+          svg.setAttribute("height", String(nextSize));
+        }
+      });
+    }
+
+    normalizeStandaloneIconElement(target);
+    return target;
+  }
+
+  function markDraggable(el) {
+    if (!el || !canEdit(el)) return;
+    el.setAttribute("draggable", "true");
+    el.dataset.draggable = "1";
+    el.style.cursor = "grab";
+  }
+
+  function ensureEids(root) {
+    var scope = root || document.body;
+    scope.querySelectorAll("*").forEach(function (node) {
+      if (!node || !node.tagName) return;
+      var tag = (node.tagName || "").toLowerCase();
+      if (EID_SKIP.indexOf(tag) !== -1) return;
+      if (isInsideIconRoot(node) && isIconStructuralTag(tag)) {
+        node.removeAttribute("data-eid");
+        node.removeAttribute("data-he-node-type");
+        return;
+      }
+      if (!node.dataset.eid) {
+        node.dataset.eid = "he-" + eidCounter;
+        eidCounter += 1;
+      }
+    });
+    markEditableNodeTypes(scope);
+  }
+
+  function getInfo(el) {
+    ensureEids(document.body);
+    var resolvedEl = getIconHost(el) || el;
+    var cs = window.getComputedStyle(resolvedEl);
+    var nodeType = getNodeType(resolvedEl) || inferEditorNodeType(resolvedEl);
+    var iconHost = getIconHost(resolvedEl);
+    var resolvedDataIcon = resolvedEl.getAttribute("data-he-icon") || (iconHost && iconHost.getAttribute ? iconHost.getAttribute("data-he-icon") : null);
+    var resolvedIsButton = nodeType === "button" || isButtonEl(resolvedEl) || looksLikeButtonContainerEl(resolvedEl);
+    var resolvedIsActionable = nodeType === "button" || isActionableEl(resolvedEl) || looksLikeButtonContainerEl(resolvedEl);
+    var resolvedIsText = nodeType === "text" || isTextEl(resolvedEl) || looksLikeTextContainerEl(resolvedEl);
+    var parent = resolvedEl.parentElement && canEdit(resolvedEl.parentElement) ? resolvedEl.parentElement : null;
+    var children = [];
+    if (resolvedEl.children && resolvedEl.children.length) {
+      for (var childIndex = 0; childIndex < resolvedEl.children.length; childIndex += 1) {
+        var child = resolvedEl.children[childIndex];
+        if (!canEdit(child)) continue;
+        children.push({
+          eid: child.dataset.eid || null,
+          tag: child.tagName.toLowerCase(),
+          label: ((child.innerText || child.textContent || child.tagName.toLowerCase()) + "").replace(/\s+/g, " ").trim().slice(0, 40),
+        });
+      }
+    }
+    return {
+      eid: resolvedEl.dataset.eid || null,
+      nodeType: nodeType,
+      tag: resolvedEl.tagName.toLowerCase(),
+      id: resolvedEl.id || null,
+      classes: resolvedEl.className || null,
+      parentEid: parent?.dataset?.eid || null,
+      parentTag: parent?.tagName?.toLowerCase() || null,
+      children: children,
+      text: (resolvedEl.innerText || "").slice(0, 200),
+      html: (resolvedEl.innerHTML || "").slice(0, 1200),
+      isText: resolvedIsText,
+      isLink: isLinkEl(resolvedEl),
+      isButton: resolvedIsButton,
+      isActionable: resolvedIsActionable,
+      attrs: {
+        href: resolvedEl.getAttribute("href"),
+        target: resolvedEl.getAttribute("target"),
+        placeholder: resolvedEl.getAttribute("placeholder"),
+        src: resolvedEl.getAttribute("src"),
+        type: resolvedEl.getAttribute("type"),
+        alt: resolvedEl.getAttribute("alt"),
+        title: resolvedEl.getAttribute("title"),
+        dataIcon: resolvedDataIcon,
+      },
+      styles: {
+        color: cs.color,
+        backgroundColor: cs.backgroundColor,
+        backgroundImage: cs.backgroundImage,
+        fontSize: cs.fontSize,
+        fontWeight: cs.fontWeight,
+        fontFamily: cs.fontFamily,
+        lineHeight: cs.lineHeight,
+        letterSpacing: cs.letterSpacing,
+        padding: cs.padding,
+        margin: cs.margin,
+        borderRadius: cs.borderRadius,
+        textAlign: cs.textAlign,
+        display: cs.display,
+      width: cs.width,
+      maxWidth: cs.maxWidth,
+      height: cs.height,
+      maxHeight: cs.maxHeight,
+      objectFit: cs.objectFit,
+        borderWidth: cs.borderWidth,
+        borderColor: cs.borderColor,
+        boxShadow: cs.boxShadow,
+        gap: cs.gap,
+        justifyContent: cs.justifyContent,
+        alignItems: cs.alignItems,
+      }
+    };
+  }
+
+  function reportHeight() {
+    var h = document.documentElement.scrollHeight || document.body.scrollHeight;
+    if (h > 0) emitToParent({ __hei_resize: h });
+  }
+
+  function serializeDocument() {
+    ensureEids(document.body);
+    var clone = document.documentElement.cloneNode(true);
+    if (clone && clone.removeAttribute) {
+      clone.removeAttribute("data-he-editor-runtime");
+      clone.removeAttribute("data-he-editor-runtime-version");
+    }
+    clone.querySelectorAll("[data-he-editor-overlay],[data-he-runtime]").forEach(function (node) {
+      node.remove();
+    });
+    clone.querySelectorAll("[contenteditable='true']").forEach(function (node) {
+      node.removeAttribute("contenteditable");
+    });
+    clone.querySelectorAll("[data-draggable]").forEach(function (node) {
+      node.removeAttribute("data-draggable");
+      node.removeAttribute("draggable");
+      if (node.style && node.style.opacity) node.style.opacity = "";
+    });
+    return "<!DOCTYPE html>\\n" + clone.outerHTML;
+  }
+
+  function queueSnapshot() {
+    if (snapshotTimer) window.clearTimeout(snapshotTimer);
+    snapshotTimer = window.setTimeout(function () {
+      emitToParent({ __editor_snapshot: true, html: serializeDocument() });
+      reportHeight();
+    }, 180);
+  }
+
+  function refreshSelectionUi() {
+    if (multiSelectMode) {
+      setMultiSelection(multiSelectedEls);
+    }
+    if (hasGroupedSelection()) {
+      var groupedBounds = placeGroupBox(multiSelectedEls);
+      selBox.style.display = "none";
+      placeResizeHandle(null);
+      placeToolbarForRect(groupedBounds);
+      syncMoveUi();
+      return;
+    }
+    groupBox.style.display = "none";
+    if (!selectedEl || !selectedEl.isConnected || !canEdit(selectedEl)) {
+      selectedEl = null;
+      clearMultiSelection();
+      setFreeMove(null, false);
+      hideSelectionUi();
+      return;
+    }
+    place(selBox, selectedEl);
+    placeToolbar(selectedEl);
+    placeResizeHandle(selectedEl);
+    syncMoveUi();
+  }
+
+  function selectElement(el) {
+    if (!canEdit(el)) return;
+    ensureEids(document.body);
+    if (freeMoveEl && freeMoveEl !== el && !freeMoveIsGroup) {
+      setFreeMove(null, false);
+    }
+    selectedEl = el;
+    if (multiSelectMode) {
+      setMultiSelection([el]);
+    } else {
+      clearMultiSelection();
+    }
+    if (dragEnabled) {
+      markDraggable(el);
+    }
+    hoverBox.style.display = "none";
+    refreshSelectionUi();
+    emitToParent({ __editor_select: true, info: getInfo(el) });
+  }
+
+  function beginInlineEdit(el, clientX, clientY) {
+    var nodeType = getNodeType(el);
+    if (!canEdit(el) || (nodeType !== "text" && nodeType !== "button" && !isTextEl(el) && !looksLikeTextContainerEl(el) && !looksLikeButtonContainerEl(el))) return false;
+    if (freeMoveEl) {
+      setFreeMove(null, false);
+      freeMoveState = null;
+    }
+    if (multiSelectMode) {
+      multiSelectMode = false;
+      clearMultiSelection();
+    }
+    editingEl = el;
+    el.contentEditable = "true";
+    el.focus();
+
+    if (document.caretRangeFromPoint && typeof clientX === "number" && typeof clientY === "number") {
+      var range = document.caretRangeFromPoint(clientX, clientY);
+      if (range) {
+        var selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      }
+    }
+
+    hideSelectionUi();
+    hoverBox.style.display = "none";
+    place(editBox, el);
+    emitToParent({ __editor_editing: true, eid: el.dataset.eid || null });
+    return true;
+  }
+
+  function moveSelected(direction) {
+    if (hasGroupedSelection()) return;
+    if (!selectedEl || !selectedEl.parentNode || isImportRootEl(selectedEl)) return;
+    var parent = selectedEl.parentNode;
+    var sibling = direction < 0 ? selectedEl.previousElementSibling : selectedEl.nextElementSibling;
+    if (!sibling) return;
+
+    if (direction < 0) {
+      parent.insertBefore(selectedEl, sibling);
+    } else {
+      parent.insertBefore(selectedEl, sibling.nextSibling);
+    }
+
+    queueSnapshot();
+    emitToParent({
+      __editor_moved: true,
+      eid: selectedEl.dataset.eid || null,
+      targetEid: sibling.dataset ? sibling.dataset.eid || null : null,
+      position: direction < 0 ? "before" : "after",
+    });
+    selectElement(selectedEl);
+  }
+
+  function toggleFreeMove() {
+    if (hasGroupedSelection()) {
+      var groupedSelection = getUniqueEditableElements(multiSelectedEls);
+      var allSimple = groupedSelection.length > 1 && groupedSelection.every(function (node) {
+        return canUseFreeMove(node);
+      });
+      if (!allSimple) return;
+      if (freeMoveEl && freeMoveIsGroup) {
+        setFreeMove(null, false);
+        freeMoveState = null;
+        return;
+      }
+      setFreeMove(groupedSelection[0] || selectedEl, true);
+      refreshSelectionUi();
+      return;
+    }
+    if (!selectedEl || isImportRootEl(selectedEl) || !canUseFreeMove(selectedEl)) return;
+    if (freeMoveEl === selectedEl && !freeMoveIsGroup) {
+      setFreeMove(null, false);
+      freeMoveState = null;
+      return;
+    }
+    setFreeMove(selectedEl, false);
+    selectElement(selectedEl);
+  }
+
+  function deleteSelected() {
+    if (hasGroupedSelection()) {
+      var selection = getUniqueEditableElements(multiSelectedEls);
+      if (!selection.length) return;
+      if (freeMoveEl && freeMoveIsGroup) {
+        setFreeMove(null, false);
+        freeMoveState = null;
+      }
+      selection.forEach(function (node) {
+        if (node && node.parentNode && !isImportRootEl(node)) {
+          node.remove();
+        }
+      });
+      clearMultiSelection();
+      selectedEl = null;
+      queueSnapshot();
+      hideSelectionUi();
+      emitToParent({ __editor_select: true, info: null });
+      return;
+    }
+    if (!selectedEl || !selectedEl.parentNode || isImportRootEl(selectedEl)) return;
+    var parentRoot = getFreeMoveRoot(selectedEl);
+    var fallback = selectedEl.nextElementSibling || selectedEl.previousElementSibling || selectedEl.parentElement;
+    if (freeMoveEl === selectedEl) {
+      setFreeMove(null, false);
+      freeMoveState = null;
+    }
+    selectedEl.remove();
+    recalculateRootMoveCapacity(parentRoot);
+    queueSnapshot();
+    if (fallback && canEdit(fallback)) {
+      selectElement(fallback);
+      return;
+    }
+    selectedEl = null;
+    setFreeMove(null, false);
+    hideSelectionUi();
+    emitToParent({ __editor_select: true, info: null });
+  }
+
+  ensureEids(document.body);
+  var normalizedOnBoot = normalizePersistedEditorLayout();
+  reportHeight();
+  if (window.ResizeObserver) {
+    new ResizeObserver(reportHeight).observe(document.body);
+  }
+  if (normalizedOnBoot) {
+    window.setTimeout(function () {
+      queueSnapshot();
+      reportHeight();
+    }, 80);
+  }
+  window.addEventListener("scroll", refreshSelectionUi, true);
+  window.addEventListener("resize", refreshSelectionUi, true);
+
+  selToolbar.addEventListener("mousedown", function (event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+
+  groupBox.addEventListener("mousedown", function (event) {
+    if (!hasGroupedSelection() || !freeMoveEl || !freeMoveIsGroup) return;
+    event.preventDefault();
+    event.stopPropagation();
+    var selection = getUniqueEditableElements(multiSelectedEls);
+    if (!selection.length || !selection.every(function (node) { return canUseFreeMove(node); })) return;
+    var items = selection.map(function (node) {
+      ensureFreeMoveStyles(node);
+      var currentOffset = getStoredMoveOffset(node);
+      var root = getFreeMoveRoot(node);
+      var anchorPosition = getElementAnchorWithinRoot(node, root, currentOffset);
+      var rect = node.getBoundingClientRect();
+      var bounds = getFreeMoveBounds(node);
+      return {
+        el: node,
+        startLeft: currentOffset.x,
+        startTop: currentOffset.y,
+        anchorLeft: anchorPosition.left,
+        anchorTop: anchorPosition.top,
+        width: Math.max(18, rect.width || getLengthValue(node, "width")),
+        height: Math.max(18, rect.height || getLengthValue(node, "height")),
+        bounds: bounds,
+        root: root
+      };
+    });
+    freeMoveState = {
+      isGroup: true,
+      startX: event.clientX,
+      startY: event.clientY,
+      items: items
+    };
+    document.body.style.userSelect = "none";
+  }, true);
+
+  selBox.addEventListener("mousedown", function (event) {
+    if (!selectedEl || freeMoveEl !== selectedEl || !canUseFreeMove(selectedEl)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    ensureFreeMoveStyles(selectedEl);
+    var currentOffset = getStoredMoveOffset(selectedEl);
+    var root = getFreeMoveRoot(selectedEl);
+    var anchorPosition = getElementAnchorWithinRoot(selectedEl, root, currentOffset);
+    var rect = selectedEl.getBoundingClientRect();
+    freeMoveState = {
+      el: selectedEl,
+      startX: event.clientX,
+      startY: event.clientY,
+      startLeft: currentOffset.x,
+      startTop: currentOffset.y,
+      anchorLeft: anchorPosition.left,
+      anchorTop: anchorPosition.top,
+      pointerOffsetX: event.clientX - rect.left,
+      pointerOffsetY: event.clientY - rect.top,
+      root: root
+    };
+    document.body.style.userSelect = "none";
+  }, true);
+
+  resizeHandle.addEventListener("mousedown", function (event) {
+    if (!selectedEl || !selectedEl.isConnected || !canResizeFreely(selectedEl)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    ensureFreeMoveStyles(selectedEl);
+    var rect = selectedEl.getBoundingClientRect();
+    var startOffset = getStoredMoveOffset(selectedEl);
+    var anchorPosition = getElementAnchorWithinRoot(selectedEl, getFreeMoveRoot(selectedEl), startOffset);
+    resizeState = {
+      el: selectedEl,
+      startX: event.clientX,
+      startY: event.clientY,
+      startWidth: rect.width,
+      startHeight: rect.height,
+      startLeft: startOffset.x,
+      startTop: startOffset.y,
+      anchorLeft: anchorPosition.left,
+      anchorTop: anchorPosition.top,
+      startFontSize: getNumericComputed(selectedEl, "fontSize", rect.height || rect.width || 18),
+      keepRatio: isImageLikeEl(selectedEl),
+      ratio: rect.height > 0 ? rect.width / rect.height : 1,
+    };
+    document.body.style.userSelect = "none";
+  }, true);
+
+  selToolbar.addEventListener("click", function (event) {
+    var button = event.target && event.target.closest ? event.target.closest("button[data-tool]") : null;
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    var tool = button.getAttribute("data-tool");
+
+    if (tool === "group") {
+      multiSelectMode = !multiSelectMode;
+      if (multiSelectMode) {
+        setMultiSelection(selectedEl ? [selectedEl] : []);
+      } else {
+        clearMultiSelection();
+        if (freeMoveIsGroup) {
+          setFreeMove(null, false);
+          freeMoveState = null;
+        }
+      }
+      refreshSelectionUi();
+      return;
+    }
+
+    if (tool === "edit" && selectedEl) {
+      beginInlineEdit(selectedEl);
+      return;
+    }
+
+    if (tool === "drag" && selectedEl) {
+      toggleFreeMove();
+      return;
+    }
+
+    if (tool === "up") {
+      moveSelected(-1);
+      return;
+    }
+
+    if (tool === "down") {
+      moveSelected(1);
+      return;
+    }
+
+    if (tool === "delete") {
+      deleteSelected();
+    }
+  }, true);
+
+  document.addEventListener("mousedown", function (event) {
+    if (event.button !== 0) return;
+    if (editingEl || resizeState || freeMoveState) return;
+    if (isRuntimeUiTarget(event.target)) return;
+    var el = getSelectionTargetFromPoint(event.clientX, event.clientY, event.target);
+    if (!canEdit(el)) return;
+    var shouldCapture =
+      isNativeInteractiveTarget(event.target) ||
+      isNativeInteractiveTarget(el) ||
+      isFieldEl(el) ||
+      isActionableEl(el) ||
+      looksLikeButtonContainerEl(el) ||
+      isTextEl(el) ||
+      looksLikeTextContainerEl(el) ||
+      isIconCandidate(el) ||
+      isImageEl(el);
+    if (shouldCapture) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+    if (multiSelectMode) {
+      toggleMultiSelection(el);
+      suppressSelectionClick = true;
+      refreshSelectionUi();
+      emitToParent({ __editor_select: true, info: selectedEl ? getInfo(selectedEl) : null });
+      return;
+    }
+    suppressSelectionClick = true;
+    selectElement(el);
+  }, true);
+
+  document.addEventListener("focusin", function (event) {
+    if (editingEl) return;
+    if (isRuntimeUiTarget(event.target)) return;
+    var target = event.target;
+    if (!target || !isNativeInteractiveTarget(target)) return;
+    window.setTimeout(function () {
+      try {
+        if (document.activeElement === target && target.blur) {
+          target.blur();
+        }
+      } catch (_err) {}
+    }, 0);
+  }, true);
+
+  document.addEventListener("mousemove", function (event) {
+    if (isRuntimeUiTarget(event.target)) {
+      hoverBox.style.display = "none";
+      return;
+    }
+    if (resizeState && resizeState.el && resizeState.el.isConnected) {
+      event.preventDefault();
+      var deltaX = event.clientX - resizeState.startX;
+      var deltaY = event.clientY - resizeState.startY;
+      var nextWidth = Math.max(18, resizeState.startWidth + deltaX);
+      var nextHeight = Math.max(18, resizeState.startHeight + deltaY);
+      var resizeBounds = getFreeMoveBounds(resizeState.el);
+      var currentLeft = resizeState.anchorLeft + resizeState.startLeft;
+      var currentTop = resizeState.anchorTop + resizeState.startTop;
+
+      if (resizeState.keepRatio) {
+        var ratio = resizeState.ratio || 1;
+        var primary = Math.max(nextWidth, nextHeight * ratio);
+        nextWidth = Math.max(18, primary);
+        nextHeight = Math.max(18, nextWidth / ratio);
+      }
+
+      nextWidth = clampValue(nextWidth, 18, Math.max(18, resizeBounds.width - currentLeft));
+      nextHeight = clampValue(nextHeight, 18, Math.max(18, resizeBounds.height - currentTop));
+
+      resizeState.el.style.width = nextWidth + "px";
+      resizeState.el.style.height = nextHeight + "px";
+
+      if (isIconCandidate(resizeState.el)) {
+        var nextIconSize = Math.max(12, Math.round(clampValue(Math.max(nextWidth, nextHeight), 12, Math.min(resizeBounds.width, resizeBounds.height, 220))));
+        resizeState.el.style.fontSize = nextIconSize + "px";
+        resizeState.el.querySelectorAll("svg,[data-he-icon-root='1']").forEach(function (node) {
+          if (node && node.style) {
+            node.style.width = nextIconSize + "px";
+            node.style.height = nextIconSize + "px";
+            node.style.fontSize = nextIconSize + "px";
+          }
+        });
+        resizeState.el.querySelectorAll("svg").forEach(function (node) {
+          if (node && node.style) {
+            node.style.width = nextIconSize + "px";
+            node.style.height = nextIconSize + "px";
+          }
+        });
+      }
+
+      selectedEl = resizeState.el;
+      hoverBox.style.display = "none";
+      place(selBox, resizeState.el);
+      placeToolbar(resizeState.el);
+      placeResizeHandle(resizeState.el);
+      updateMoveFeedback(getFreeMoveRoot(resizeState.el), currentLeft, currentTop, nextWidth, nextHeight, false, false);
+      syncMoveUi();
+      return;
+    }
+
+    if (freeMoveState && freeMoveState.isGroup && freeMoveState.items && freeMoveState.items.length) {
+      event.preventDefault();
+      var deltaX = event.clientX - freeMoveState.startX;
+      var deltaY = event.clientY - freeMoveState.startY;
+      var minDeltaX = -Infinity;
+      var maxDeltaX = Infinity;
+      var minDeltaY = -Infinity;
+      var maxDeltaY = Infinity;
+
+      freeMoveState.items.forEach(function (item) {
+        var minDx = -item.anchorLeft - item.startLeft;
+        var maxDx = item.bounds.width - (item.anchorLeft + item.width) - item.startLeft;
+        var minDy = -item.anchorTop - item.startTop;
+        var maxDy = item.bounds.height - (item.anchorTop + item.height) - item.startTop;
+        minDeltaX = Math.max(minDeltaX, minDx);
+        maxDeltaX = Math.min(maxDeltaX, maxDx);
+        minDeltaY = Math.max(minDeltaY, minDy);
+        maxDeltaY = Math.min(maxDeltaY, maxDy);
+      });
+
+      var clampedDx = clampValue(deltaX, minDeltaX, maxDeltaX);
+      var clampedDy = clampValue(deltaY, minDeltaY, maxDeltaY);
+
+      freeMoveState.items.forEach(function (item) {
+        applyFreeMoveTransform(item.el, item.startLeft + clampedDx, item.startTop + clampedDy);
+      });
+
+      var groupedBounds = placeGroupBox(multiSelectedEls);
+      selBox.style.display = "none";
+      placeResizeHandle(null);
+      placeToolbarForRect(groupedBounds);
+      if (groupedBounds) {
+        var groupRoot = getEditorRoot(freeMoveState.items[0].el);
+        var groupRootRect = groupRoot.getBoundingClientRect();
+        var groupLeft = groupedBounds.left - groupRootRect.left + (groupRoot.scrollLeft || 0);
+        var groupTop = groupedBounds.top - groupRootRect.top + (groupRoot.scrollTop || 0);
+        updateMoveFeedback(groupRoot, groupLeft, groupTop, groupedBounds.width, groupedBounds.height, false, false);
+      }
+      syncMoveUi();
+      return;
+    }
+
+    if (freeMoveState && freeMoveState.el && freeMoveState.el.isConnected) {
+      event.preventDefault();
+      var moveBounds = getFreeMoveBounds(freeMoveState.el);
+      var moveRoot = freeMoveState.root || moveBounds.parent;
+      var rootRect = moveRoot.getBoundingClientRect();
+      var rootScrollLeft = moveRoot.scrollLeft || 0;
+      var rootScrollTop = moveRoot.scrollTop || 0;
+      var moveWidth = Math.max(18, freeMoveState.el.getBoundingClientRect().width || getLengthValue(freeMoveState.el, "width"));
+      var moveHeight = Math.max(18, freeMoveState.el.getBoundingClientRect().height || getLengthValue(freeMoveState.el, "height"));
+      var pointerLeftInRoot = event.clientX - rootRect.left + rootScrollLeft - freeMoveState.pointerOffsetX;
+      var pointerTopInRoot = event.clientY - rootRect.top + rootScrollTop - freeMoveState.pointerOffsetY;
+      var nextLeft = pointerLeftInRoot - freeMoveState.anchorLeft;
+      var nextTop = pointerTopInRoot - freeMoveState.anchorTop;
+      var rootCenterX = rootScrollLeft + moveBounds.width / 2;
+      var rootCenterY = rootScrollTop + moveBounds.height / 2;
+      var desiredCenterX = freeMoveState.anchorLeft + nextLeft + moveWidth / 2;
+      var desiredCenterY = freeMoveState.anchorTop + nextTop + moveHeight / 2;
+      var snapX = Math.abs(desiredCenterX - rootCenterX) <= 8;
+      var snapY = Math.abs(desiredCenterY - rootCenterY) <= 8;
+
+      if (snapX) {
+        nextLeft = rootCenterX - moveWidth / 2 - freeMoveState.anchorLeft;
+      }
+      if (snapY) {
+        nextTop = rootCenterY - moveHeight / 2 - freeMoveState.anchorTop;
+      }
+      nextLeft = clampValue(
+        nextLeft,
+        -freeMoveState.anchorLeft,
+        Math.max(-freeMoveState.anchorLeft, moveBounds.width - (freeMoveState.anchorLeft + moveWidth))
+      );
+      nextTop = clampValue(
+        nextTop,
+        -freeMoveState.anchorTop,
+        Math.max(-freeMoveState.anchorTop, moveBounds.height - (freeMoveState.anchorTop + moveHeight))
+      );
+      applyFreeMoveTransform(freeMoveState.el, nextLeft, nextTop);
+      selectedEl = freeMoveState.el;
+      hoverBox.style.display = "none";
+      place(selBox, freeMoveState.el);
+      placeToolbar(freeMoveState.el);
+      placeResizeHandle(freeMoveState.el);
+      updateMoveFeedback(moveRoot, freeMoveState.anchorLeft + nextLeft, freeMoveState.anchorTop + nextTop, moveWidth, moveHeight, snapX, snapY);
+      syncMoveUi();
+      return;
+    }
+    if (editingEl) return;
+    var el = getSelectionTargetFromPoint(event.clientX, event.clientY, event.target);
+    if (!canEdit(el) || el === selectedEl) {
+      hoverBox.style.display = "none";
+      return;
+    }
+    place(hoverBox, el);
+    hoverTag.textContent = el.tagName.toLowerCase() + (el.id ? "#" + el.id : "") + (el.dataset.eid ? " [" + el.dataset.eid + "]" : "");
+  });
+
+  document.addEventListener("mouseleave", function () {
+    hoverBox.style.display = "none";
+  });
+
+  document.addEventListener("mouseup", function () {
+    if (resizeState && resizeState.el) {
+      var resizedEl = resizeState.el;
+      resizeState = null;
+      document.body.style.userSelect = "";
+      hideMoveFeedback();
+      recalculateRootMoveCapacity(getFreeMoveRoot(resizedEl));
+      queueSnapshot();
+      selectElement(resizedEl);
+      return;
+    }
+    if (freeMoveState && freeMoveState.isGroup && freeMoveState.items && freeMoveState.items.length) {
+      var movedItems = freeMoveState.items.slice();
+      freeMoveState = null;
+      document.body.style.userSelect = "";
+      hideMoveFeedback();
+      movedItems.forEach(function (item) {
+        recalculateRootMoveCapacity(getFreeMoveRoot(item.el));
+      });
+      queueSnapshot();
+      refreshSelectionUi();
+      return;
+    }
+    if (!freeMoveState || !freeMoveState.el) return;
+    var movedEl = freeMoveState.el;
+    freeMoveState = null;
+    document.body.style.userSelect = "";
+    hideMoveFeedback();
+    recalculateRootMoveCapacity(getFreeMoveRoot(movedEl));
+    queueSnapshot();
+    selectElement(movedEl);
+  }, true);
+
+  document.addEventListener("click", function (event) {
+    if (editingEl) return;
+    if (isRuntimeUiTarget(event.target)) return;
+    if (suppressSelectionClick) {
+      suppressSelectionClick = false;
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (multiSelectMode) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    var el = getSelectionTargetFromPoint(event.clientX, event.clientY, event.target);
+    if (!canEdit(el)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    selectElement(el);
+  }, true);
+
+  document.addEventListener("dblclick", function (event) {
+    if (isRuntimeUiTarget(event.target)) return;
+    if (multiSelectMode) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    var el = getSelectionTargetFromPoint(event.clientX, event.clientY, event.target);
+    if (!canEdit(el)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (isTextEl(el) || looksLikeTextContainerEl(el) || looksLikeButtonContainerEl(el)) {
+      selectElement(el);
+      beginInlineEdit(el, event.clientX, event.clientY);
+      return;
+    }
+    selectElement(el);
+  }, true);
+
+  document.addEventListener("blur", function (event) {
+    var el = event.target;
+    if (el !== editingEl) return;
+    el.contentEditable = "false";
+    editBox.style.display = "none";
+
+    emitToParent({
+      __editor_text_change: true,
+      eid: el.dataset.eid || null,
+      text: el.innerText || "",
+      html: el.innerHTML || "",
+    });
+
+    queueSnapshot();
+
+    var saved = el;
+    window.setTimeout(function () {
+      editingEl = null;
+      selectElement(saved);
+    }, 40);
+  }, true);
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && editingEl) {
+      editingEl.contentEditable = "false";
+      editingEl.blur();
+      return;
+    }
+    if (event.key === "Escape" && freeMoveEl) {
+      freeMoveState = null;
+      document.body.style.userSelect = "";
+      hideMoveFeedback();
+      setFreeMove(null);
+    }
+    if (event.key === "Escape" && resizeState) {
+      resizeState = null;
+      document.body.style.userSelect = "";
+      hideMoveFeedback();
+    }
+  }, true);
+
+  function enableDrag() {
+    dragEnabled = true;
+    ensureEids(document.body);
+    BLOCK_TAGS.forEach(function (tag) {
+      document.querySelectorAll(tag).forEach(function (el) {
+        if (!el.dataset.draggable) markDraggable(el);
+      });
+    });
+    if (selectedEl) markDraggable(selectedEl);
+  }
+
+  document.addEventListener("dragstart", function (event) {
+    if (!dragEnabled) return;
+    dragEl = event.target;
+    if (dragEl && dragEl.style) dragEl.style.opacity = "0.4";
+    event.dataTransfer.effectAllowed = "move";
+  });
+
+  document.addEventListener("dragend", function () {
+    if (dragEl && dragEl.style) {
+      dragEl.style.opacity = "";
+      dragEl.style.cursor = "grab";
+    }
+    dragEl = null;
+    dropLine.style.display = "none";
+  });
+
+  document.addEventListener("dragover", function (event) {
+    if (!dragEl) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    var target = event.target;
+    if (!target || target === dragEl || !canEdit(target)) return;
+    var rect = target.getBoundingClientRect();
+    var mid = rect.top + rect.height / 2;
+    dropLine.style.display = "block";
+    dropLine.style.left = rect.left + "px";
+    dropLine.style.width = rect.width + "px";
+    dropLine.style.top = (event.clientY < mid ? rect.top - 1 : rect.bottom - 1) + "px";
+  });
+
+  document.addEventListener("drop", function (event) {
+    event.preventDefault();
+    dropLine.style.display = "none";
+    var target = event.target;
+    if (!dragEl || !target || target === dragEl) return;
+
+    var rect = target.getBoundingClientRect();
+    var mid = rect.top + rect.height / 2;
+    var position = event.clientY < mid ? "before" : "after";
+
+    if (position === "before") {
+      target.parentNode && target.parentNode.insertBefore(dragEl, target);
+    } else {
+      target.parentNode && target.parentNode.insertBefore(dragEl, target.nextSibling);
+    }
+
+    queueSnapshot();
+    emitToParent({
+      __editor_moved: true,
+      eid: dragEl.dataset.eid || null,
+      targetEid: target.dataset.eid || null,
+      position: position,
+    });
+    if (dragEl) selectElement(dragEl);
+  });
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (!data || !data.__editor_cmd) return;
+
+    ensureEids(document.body);
+    var el = data.eid ? document.querySelector("[data-eid='" + data.eid + "']") : null;
+
+    if (data.cmd === "style" && el) {
+      el.style[data.prop] = data.value;
+      selectElement(el);
+      queueSnapshot();
+    }
+
+    if (data.cmd === "style_query" && el) {
+      applyStyleQuery(el, data.selector, data.prop, data.value);
+      selectElement(el);
+      queueSnapshot();
+    }
+
+    if (data.cmd === "style_batch" && el && Array.isArray(data.updates)) {
+      data.updates.forEach(function (update) {
+        if (!update || !update.prop) return;
+        if (update.selector) {
+          applyStyleQuery(el, update.selector, update.prop, update.value);
+        } else if (el.style) {
+          el.style[update.prop] = update.value;
+        }
+      });
+      selectElement(el);
+      queueSnapshot();
+    }
+
+    if (data.cmd === "icon_patch" && el) {
+      var patchedIcon = applyIconPatch(el, data);
+      if (patchedIcon && canEdit(patchedIcon)) {
+        selectElement(patchedIcon);
+        queueSnapshot();
+      }
+    }
+
+    if (data.cmd === "text" && el) {
+      el.innerText = data.value;
+      selectElement(el);
+      queueSnapshot();
+    }
+
+    if (data.cmd === "html" && el) {
+      el.innerHTML = data.value;
+      ensureEids(el);
+      markEditableNodeTypes(el);
+      selectElement(el);
+      queueSnapshot();
+    }
+
+    if (data.cmd === "replace" && el) {
+      var oldEid = el.dataset ? el.dataset.eid || null : null;
+      var replaceRange = document.createRange();
+      replaceRange.selectNode(el);
+      var replaceFragment = replaceRange.createContextualFragment(data.value || "");
+      var replacementNodes = Array.prototype.slice.call(replaceFragment.childNodes || []);
+      var firstReplacement = null;
+
+      for (var replacementIndex = 0; replacementIndex < replacementNodes.length; replacementIndex += 1) {
+        var candidate = replacementNodes[replacementIndex];
+        if (candidate && candidate.nodeType === 1) {
+          firstReplacement = candidate;
+          break;
+        }
+      }
+
+      if (el.parentNode) {
+        el.parentNode.insertBefore(replaceFragment, el);
+        el.remove();
+        ensureEids(document.body);
+        markEditableNodeTypes(document.body);
+        if (firstReplacement && firstReplacement.nodeType === 1) {
+          if (oldEid && firstReplacement.dataset && !firstReplacement.dataset.eid) {
+            firstReplacement.dataset.eid = oldEid;
+          }
+          copyPersistedLayoutState(el, firstReplacement);
+          normalizeStandaloneIconElement(firstReplacement);
+          normalizeFreeMoveElement(firstReplacement);
+        }
+        queueSnapshot();
+        if (firstReplacement && canEdit(firstReplacement)) {
+          selectElement(firstReplacement);
+        } else if (el.parentElement && canEdit(el.parentElement)) {
+          selectElement(el.parentElement);
+        } else {
+          selectedEl = null;
+          setFreeMove(null);
+          freeMoveState = null;
+          hideSelectionUi();
+          emitToParent({ __editor_select: true, info: null });
+        }
+      }
+    }
+
+    if (data.cmd === "attr" && el) {
+      if (data.value === "") el.removeAttribute(data.attr);
+      else el.setAttribute(data.attr, data.value);
+      if (data.attr === "data-he-free-move" && data.value === "") {
+        resetFreeMoveState(el);
+      }
+      if ((data.attr === "data-he-move-x" || data.attr === "data-he-move-y") && data.value === "") {
+        clearFreeMoveTransform(el);
+      }
+      if (data.attr === "data-he-base-transform" && data.value === "") {
+        clearFreeMoveTransform(el);
+      }
+      selectElement(el);
+      queueSnapshot();
+    }
+
+    if (data.cmd === "insert" && el) {
+      var range = document.createRange();
+      range.selectNode(el);
+      var fragment = range.createContextualFragment(data.value || "");
+      var insertedNodes = Array.prototype.slice.call(fragment.childNodes || []);
+      var firstElement = null;
+      for (var i = 0; i < insertedNodes.length; i += 1) {
+        if (insertedNodes[i] && insertedNodes[i].nodeType === 1) {
+          firstElement = insertedNodes[i];
+          break;
+        }
+      }
+
+      if (data.position === "beforebegin" && el.parentNode) {
+        el.parentNode.insertBefore(fragment, el);
+      } else if (data.position === "afterbegin") {
+        el.insertBefore(fragment, el.firstChild);
+      } else if (data.position === "beforeend") {
+        el.appendChild(fragment);
+      } else if (data.position === "afterend" && el.parentNode) {
+        el.parentNode.insertBefore(fragment, el.nextSibling);
+      }
+
+      ensureEids(document.body);
+      markEditableNodeTypes(document.body);
+      queueSnapshot();
+      if (firstElement && canEdit(firstElement)) {
+        selectElement(firstElement);
+      } else {
+        selectElement(el);
+      }
+    }
+
+    if (data.cmd === "enable_drag") {
+      enableDrag();
+    }
+
+    if (data.cmd === "highlight" && el) {
+      selectElement(el);
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+
+    if (data.cmd === "move_up" && el) {
+      selectElement(el);
+      moveSelected(-1);
+    }
+
+    if (data.cmd === "move_down" && el) {
+      selectElement(el);
+      moveSelected(1);
+    }
+
+    if (data.cmd === "delete" && el) {
+      selectElement(el);
+      deleteSelected();
+    }
+
+    if (data.cmd === "cleanup_layout") {
+      var cleanupRoot = el || (selectedEl ? getEditorRoot(selectedEl) : document.querySelector("[data-he-import-root='1']"));
+      if (cleanupRoot && cleanupLayout(cleanupRoot)) {
+        queueSnapshot();
+        if (selectedEl && selectedEl.isConnected) {
+          selectElement(selectedEl);
+        } else if (cleanupRoot && canEdit(cleanupRoot)) {
+          selectElement(cleanupRoot);
+        }
+      }
+    }
+
+    if (data.cmd === "deselect") {
+      selectedEl = null;
+      setFreeMove(null);
+      freeMoveState = null;
+      hideSelectionUi();
+    }
+  });
+})();
+`.trim()
+}
